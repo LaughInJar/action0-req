@@ -140,3 +140,84 @@ print(headers.as_str(separator="\n"))
 # Authorization: Bearer secret
 # Accept: */*
 ```
+
+## Requests
+
+{py:class}`~action0.req.request.Request` represents an HTTP request:
+method, URL, headers, body and HTTP version — every part a plain mutable
+attribute (the URL a {py:class}`~action0.url.base.Url` from
+[action0-url](https://laughinjar.github.io/action0-url/), the headers a
+{py:class}`~action0.req.headers.Headers`). The URL can be passed as a
+string or an existing `Url` (which is copied); `query` replaces the URL's
+query like the `Url` constructor does; the method is uppercased:
+
+```python
+from action0.req import Request
+
+req = Request("https://api.example.com/items", query={"page": 2})
+req.headers["Accept"] = "application/json"
+print(req.method, req.url)
+# GET https://api.example.com/items?page=2
+print(req.as_str(separator="\n"))
+# GET /items?page=2 HTTP/1.1
+# Host: api.example.com
+# Accept: application/json
+```
+
+`as_str()` renders the wire format: the request line with the origin-form
+target and the headers, deriving `Host` from the URL when none is set
+(like `Headers.as_str()` it does NOT redact secret values — `repr()`
+does). `copy()` returns an independent request, with keyword overrides
+for any constructor argument:
+
+```python
+from action0.req import Request
+
+req = Request("https://user:secret@api.example.com/items")
+clone = req.copy(method="POST", query={"id": 7})
+print(clone)
+# Request(POST https://user:***@api.example.com/items?id=7)
+```
+
+### Request bodies
+
+The body can be set as `bytes`, `str` or a streaming
+{py:class}`~action0.req.body.BodyProducer` — and retrieved in any of the
+three forms, regardless of how it was set. Text is encoded/decoded with
+the `Content-Type` charset (utf-8 when there is none):
+
+```python
+from action0.req import Request
+
+req = Request("https://api.example.com/items", "POST", body='{"a": 1}')
+print(req.body_str())
+# {"a": 1}
+print(req.body_bytes())
+# b'{"a": 1}'
+print(req.body_producer().content_length())
+# 8
+print(req.as_str(include_body=True, separator="\n"))
+# POST /items HTTP/1.1
+# Host: api.example.com
+#
+# {"a": 1}
+```
+
+A `BodyProducer` body is streamed in chunks — synchronously via
+`chunks()` or asynchronously via `achunks()`; `as_str(include_body=True)`
+never consumes it and shows a placeholder instead. `BytesBody` is the
+in-memory implementation; file- and iterable-backed producers are
+planned:
+
+```python
+from action0.req import BytesBody, Request
+
+req = Request("https://api.example.com/upload", "PUT", body=BytesBody(b"data"))
+print(list(req.body_producer().chunks()))
+# [b'data']
+print(req.as_str(include_body=True, separator="\n"))
+# PUT /upload HTTP/1.1
+# Host: api.example.com
+#
+# <BytesBody>
+```

@@ -1,10 +1,9 @@
 # API reference
 
-The public constants (and, later, classes) are importable from the
-package root:
+The public constants and classes are importable from the package root:
 
 ```python
-from action0.req import Header, Method, Status
+from action0.req import BodyProducer, BytesBody, Header, Headers, Method, Request, Status
 ```
 
 ## Headers and Header
@@ -16,10 +15,19 @@ from action0.req import Header, Method, Status
    :special-members: __eq__, __getitem__, __setitem__, __delitem__, __iter__, __len__, __contains__, __repr__
 ```
 
-## Method
+## Request and Method
 
 ```{eval-rst}
 .. automodule:: action0.req.request
+   :members:
+   :undoc-members:
+   :special-members: __eq__, __repr__
+```
+
+## Body producers
+
+```{eval-rst}
+.. automodule:: action0.req.body
    :members:
    :undoc-members:
 ```

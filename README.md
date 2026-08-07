@@ -13,13 +13,13 @@ Requires Python 3.11 or newer.
 Full documentation including the API reference:
 <https://laughinjar.github.io/action0-req/>
 
-**Status: under construction.** The `Headers` mapping and the header
-name, status code and method constants exist; still planned:
+**Status: under construction.** `Headers`, `Request`, the body streaming
+interface (`BodyProducer` / `BytesBody`) and the header name, status code
+and method constants exist; still planned:
 
-- `action0.req.request.Request` and `action0.req.response.Response` —
-  every part (method, URL, status, headers, body) a plain attribute.
-- Optional streaming of request and response bodies — sync and async,
-  convenience and performance focused.
+- `action0.req.response.Response` — every part (status, headers, body) a
+  plain attribute.
+- More body producers for streaming: file- and (async-)iterable-backed.
 
 ## Usage
 
@@ -53,6 +53,23 @@ print(headers.as_str())  # Content-Type: text/html\r\nSet-Cookie: a=1\r\nset-coo
 
 # repr()/str() redact secrets, only as_str() renders them
 print(Headers({"Authorization": "Bearer tok"}))  # Headers(Authorization: ***)
+```
+
+`Request` combines a method, a `Url` (from action0-url), `Headers` and a
+body (`bytes`, `str` or a streaming `BodyProducer` — retrievable in any
+of the three forms):
+
+```python
+from action0.req import Request
+
+req = Request("https://api.example.com/items", query={"page": 2})
+req.headers["Accept"] = "application/json"
+print(req.as_str())
+# GET /items?page=2 HTTP/1.1\r\nHost: api.example.com\r\nAccept: application/json
+
+post = req.copy(method="POST", body='{"a": 1}')
+print(post.body_bytes())  # b'{"a": 1}'
+print(post)  # Request(POST https://api.example.com/items?page=2)
 ```
 
 ## Installation

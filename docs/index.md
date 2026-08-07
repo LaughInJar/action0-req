@@ -21,10 +21,15 @@ still to come):
   case-insensitive, multi-value aware mapping of HTTP header fields that
   preserves the representation exactly and redacts secret values in
   `repr()`.
-- `Request` / `Response` — every part (method, URL, status, headers,
-  body) a plain attribute; parse once, change what you need *(planned)*.
-- Optional streaming of request and response bodies — sync and async,
-  convenience and performance focused *(planned)*.
+- {py:class}`~action0.req.request.Request` — method, URL, headers, body
+  and HTTP version as plain attributes, with typed body accessors
+  (`body_bytes()` / `body_str()` / `body_producer()`), `copy()` with
+  overrides and a wire-format `as_str()`.
+- `Response` — every part (status, headers, body) a plain attribute
+  *(planned)*.
+- Streaming of request and response bodies via the
+  {py:class}`~action0.req.body.BodyProducer` protocol — sync and async;
+  file- and iterable-backed producers *(planned)*.
 - Fully typed (checked with mypy strict, pyright and ty), Python 3.11+,
   no runtime dependencies beyond `action0-url`.
 
