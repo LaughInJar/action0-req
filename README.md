@@ -13,11 +13,9 @@ Requires Python 3.11 or newer.
 Full documentation including the API reference:
 <https://laughinjar.github.io/action0-req/>
 
-**Status: under construction.** The header name, status code and method
-constants exist; still planned:
+**Status: under construction.** The `Headers` mapping and the header
+name, status code and method constants exist; still planned:
 
-- `action0.req.headers.Headers` — a case-insensitive, multi-value aware
-  mapping of HTTP header fields.
 - `action0.req.request.Request` and `action0.req.response.Response` —
   every part (method, URL, status, headers, body) a plain attribute.
 - Optional streaming of request and response bodies — sync and async,
@@ -37,6 +35,24 @@ print(Method.POST)  # POST
 print(Status.NOT_FOUND)  # 404
 print(Status.NOT_FOUND.phrase)  # Not Found
 print(Status.NOT_FOUND.is_client_error)  # True
+```
+
+`Headers` is an ordered, case-insensitive, multi-value aware mapping of
+header fields that preserves the representation (order and casing)
+exactly:
+
+```python
+from action0.req import Headers
+
+headers = Headers({"Content-Type": "text/html"})
+headers.add("Set-Cookie", "a=1")
+headers.add("set-cookie", "b=2")
+print(headers["CONTENT-TYPE"])  # text/html
+print(headers.get_all("Set-Cookie"))  # ['a=1', 'b=2']
+print(headers.as_str())  # Content-Type: text/html\r\nSet-Cookie: a=1\r\nset-cookie: b=2
+
+# repr()/str() redact secrets, only as_str() renders them
+print(Headers({"Authorization": "Bearer tok"}))  # Headers(Authorization: ***)
 ```
 
 ## Installation

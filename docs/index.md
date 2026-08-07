@@ -17,8 +17,10 @@ still to come):
   {py:class}`~action0.req.request.Method` — `StrEnum`/`IntEnum` constants
   for the IANA-registered header field names, status codes (with reason
   phrases and category properties) and request methods.
-- `Headers` — a case-insensitive, multi-value aware mapping of HTTP
-  header fields *(planned)*.
+- {py:class}`~action0.req.headers.Headers` — an ordered,
+  case-insensitive, multi-value aware mapping of HTTP header fields that
+  preserves the representation exactly and redacts secret values in
+  `repr()`.
 - `Request` / `Response` — every part (method, URL, status, headers,
   body) a plain attribute; parse once, change what you need *(planned)*.
 - Optional streaming of request and response bodies — sync and async,

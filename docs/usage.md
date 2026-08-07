@@ -62,3 +62,81 @@ print(Header.X_FORWARDED_FOR)
 print(Header("ETag") is Header.ETAG)
 # True
 ```
+
+## Working with headers
+
+{py:class}`~action0.req.headers.Headers` is an ordered, case-insensitive,
+multi-value aware mapping of HTTP header fields. It behaves like a dict
+(a `MutableMapping`) where subscription works with a single value per
+field — the last line's — while `add()`, `get_all()` and friends handle
+multiple lines. Lookup is case-insensitive per RFC 9110, but the order
+and casing of the representation are preserved exactly:
+
+```python
+from action0.req import Headers
+
+headers = Headers({"Content-Type": "text/html"})
+headers.add("Set-Cookie", "a=1")
+headers.add("set-cookie", "b=2")
+print(headers["CONTENT-TYPE"])
+# text/html
+print(headers.get_all("Set-Cookie"))
+# ['a=1', 'b=2']
+print(len(headers), "SET-COOKIE" in headers)
+# 2 True
+print(headers.as_str(separator="\n"))
+# Content-Type: text/html
+# Set-Cookie: a=1
+# set-cookie: b=2
+```
+
+Names are never normalized beyond casing — an underscore does not match
+a dash (`headers["content_type"]` would *not* find `Content-Type`); use
+the {py:class}`~action0.req.headers.Header` constants instead of magic.
+
+Headers can be created from (and merged with) a raw header block, a
+mapping, a list of name/value tuples or another instance; non-string
+values are coerced. `update()` replaces existing fields in place and
+appends new ones:
+
+```python
+from action0.req import Headers
+
+headers = Headers("Host: example.com\nAccept: text/html")
+headers.update({"Accept": "application/json", "Content-Length": 42})
+print(headers.as_str(separator="\n"))
+# Host: example.com
+# Accept: application/json
+# Content-Length: 42
+```
+
+`get_values()` splits the lines into their comma-separated elements
+(RFC 9110 list syntax — don't use it for `Set-Cookie`, whose values can
+contain literal commas):
+
+```python
+from action0.req import Headers
+
+headers = Headers("Vary: Accept-Encoding, Accept-Language\nVary: Cookie")
+print(headers.get_values("vary"))
+# ['Accept-Encoding', 'Accept-Language', 'Cookie']
+```
+
+Equality ignores the order of different fields and the casing of names,
+but respects the order of a field's own lines. `repr()` and `str()`
+redact the values of secret fields (`Authorization`, cookies, … — the
+overridable `Headers.secret_names` set); only the wire rendering
+`as_str()` keeps them:
+
+```python
+from action0.req import Headers
+
+print(Headers("A: 1\nB: 2") == Headers("b: 2\nA: 1"))
+# True
+headers = Headers({"Authorization": "Bearer secret", "Accept": "*/*"})
+print(headers)
+# Headers(Authorization: ***, Accept: */*)
+print(headers.as_str(separator="\n"))
+# Authorization: Bearer secret
+# Accept: */*
+```
