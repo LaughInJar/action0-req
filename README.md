@@ -55,8 +55,8 @@ print(headers.as_str(separator="\n"))  # "\r\n" by default
 print(Headers({"Authorization": "Bearer tok"}))  # Headers(Authorization: ***)
 ```
 
-`Request` combines a method, a `Url` (from action0-url), `Headers` and a
-body (`bytes`, `str` or a streaming `BodyProducer` — retrievable in any
+`Request` combines a method, a `Url` (from action0-url), `Headers`, a
+`meta` dict for application metadata (never on the wire) and a body (`bytes`, `str` or a streaming `BodyProducer` — retrievable in any
 of the three forms):
 
 ```python

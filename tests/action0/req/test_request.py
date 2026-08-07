@@ -292,3 +292,46 @@ class MethodTestCase(unittest.TestCase):
                 "TRACE",
             ],
         )
+
+
+class MetaTestCase(unittest.TestCase):
+    """
+    tests for the :py:attr:`Request.meta` application metadata
+    """
+
+    def test_defaults_to_an_empty_dict(self) -> None:
+        """
+        Test that every request has its own empty meta dict.
+        """
+        request = Request("https://example.com/")
+        self.assertEqual(request.meta, {})
+        request.meta["my-lib.key"] = "value"
+        self.assertEqual(Request("https://example.com/").meta, {})
+
+    def test_constructor_copies_the_given_mapping(self) -> None:
+        """
+        Test that later changes to the source mapping don't leak in.
+        """
+        source = {"my-lib.key": "value"}
+        request = Request("https://example.com/", meta=source)
+        source["my-lib.key"] = "changed"
+        self.assertEqual(request.meta, {"my-lib.key": "value"})
+
+    def test_copy_gets_its_own_meta_dict(self) -> None:
+        """
+        Test that copies carry the entries but not the dict identity.
+        """
+        request = Request("https://example.com/", meta={"my-lib.key": "value"})
+        copied = request.copy()
+        copied.meta["my-lib.key"] = "changed"
+        self.assertEqual(request.meta, {"my-lib.key": "value"})
+        overridden = request.copy(meta={"other": 1})
+        self.assertEqual(overridden.meta, {"other": 1})
+
+    def test_meta_is_not_part_of_equality(self) -> None:
+        """
+        Test that meta is metadata, like the docstring promises.
+        """
+        plain = Request("https://example.com/")
+        tagged = Request("https://example.com/", meta={"my-lib.key": "value"})
+        self.assertEqual(plain, tagged)

@@ -226,3 +226,44 @@ class ResponseCopyEqReprTestCase(unittest.TestCase):
         self.assertNotIn("secret", repr(resp))
         self.assertEqual(repr(Response(599)), "Response(599)")
         self.assertEqual(repr(Response(404, reason="Nope")), "Response(404 Nope)")
+
+
+class MetaTestCase(unittest.TestCase):
+    """
+    tests for the :py:attr:`Response.meta` application metadata
+    """
+
+    def test_defaults_to_an_empty_dict(self) -> None:
+        """
+        Test that every response has its own empty meta dict.
+        """
+        response = Response(200)
+        self.assertEqual(response.meta, {})
+        response.meta["my-lib.key"] = "value"
+        self.assertEqual(Response(200).meta, {})
+
+    def test_constructor_copies_the_given_mapping(self) -> None:
+        """
+        Test that later changes to the source mapping don't leak in.
+        """
+        source = {"my-lib.key": "value"}
+        response = Response(200, meta=source)
+        source["my-lib.key"] = "changed"
+        self.assertEqual(response.meta, {"my-lib.key": "value"})
+
+    def test_copy_gets_its_own_meta_dict(self) -> None:
+        """
+        Test that copies carry the entries but not the dict identity.
+        """
+        response = Response(200, meta={"my-lib.key": "value"})
+        copied = response.copy()
+        copied.meta["my-lib.key"] = "changed"
+        self.assertEqual(response.meta, {"my-lib.key": "value"})
+        overridden = response.copy(meta={"other": 1})
+        self.assertEqual(overridden.meta, {"other": 1})
+
+    def test_meta_is_not_part_of_equality(self) -> None:
+        """
+        Test that meta is metadata, like the docstring promises.
+        """
+        self.assertEqual(Response(200), Response(200, meta={"my-lib.key": "value"}))

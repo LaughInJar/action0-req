@@ -175,6 +175,19 @@ print(clone)
 # Request(POST https://user:***@api.example.com/items?id=7)
 ```
 
+Both requests and responses carry a `meta` dict for application metadata
+— correlation ids, tracing context, per-request knobs for the HTTP layer
+on top — never sent on the wire and excluded from equality. `copy()`
+gives the clone its own (shallow) copy:
+
+```python
+from action0.req import Request
+
+req = Request("https://api.example.com/items", meta={"my-lib.correlation-id": "abc123"})
+print(req.copy().meta)
+# {'my-lib.correlation-id': 'abc123'}
+```
+
 ### Request bodies
 
 The body can be set as `bytes`, `str` or a streaming

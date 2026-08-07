@@ -1,6 +1,7 @@
 """The HTTP response representation (:py:class:`Response`)."""
 
 from typing import Any
+from typing import Mapping
 from typing import Union
 
 from .body import BodyProducer
@@ -54,6 +55,7 @@ class Response:
         reason: Union[str, None] = None,
         http_version: str = "HTTP/1.1",
         request: Union[Request, None] = None,
+        meta: Union[Mapping[str, Any], None] = None,
     ) -> None:
         """
         :param status: the status code, a :py:class:`~action0.req.status.Status`
@@ -69,6 +71,8 @@ class Response:
                              line
         :param request: the request that produced this response — metadata:
                         shared, not copied, and not part of equality
+        :param meta: initial application metadata riding along with the
+                     response (see :py:attr:`meta`)
         """
         self.status: int = status
         self.headers = Headers(headers)
@@ -76,6 +80,12 @@ class Response:
         self.reason = reason
         self.http_version = http_version
         self.request = request
+        self.meta: dict[str, Any] = dict(meta) if meta is not None else {}
+        """Application metadata riding along with the response — e.g. a
+        backend's native response object, cache markers, timings — never
+        sent on the wire and not part of :py:meth:`__eq__`. The dict is
+        the response's own (the constructor copies the given mapping);
+        libraries should namespace their keys."""
 
     @property
     def phrase(self) -> str:
@@ -153,9 +163,11 @@ class Response:
     def copy(self, **overrides: Any) -> "Response":
         """
         An independent copy of this response (with its own ``Headers``
-        instance), optionally with attributes replaced. The body and the
-        ``request`` reference are carried over as-is — in particular a
-        :py:class:`~action0.req.body.BodyProducer` is shared, not copied.
+        instance and ``meta`` dict), optionally with attributes replaced.
+        The body and the ``request`` reference are carried over as-is —
+        in particular a :py:class:`~action0.req.body.BodyProducer` is
+        shared, not copied; the ``meta`` values are shared too (shallow
+        copy).
 
         Example::
 
@@ -173,6 +185,7 @@ class Response:
             "reason": self.reason,
             "http_version": self.http_version,
             "request": self.request,
+            "meta": self.meta,
         }
         kwargs.update(overrides)
         return Response(**kwargs)
@@ -207,7 +220,8 @@ class Response:
         HTTP version are equal, each with the part's own equality
         semantics (e.g. header name casing doesn't matter). The body is
         compared as set: ``b"x"`` and ``"x"`` are different bodies. The
-        ``request`` reference is metadata and not compared.
+        ``request`` reference and the :py:attr:`meta` dict are metadata
+        and not compared.
 
         :param other: the Response to compare with
         :return: whether the responses are equal

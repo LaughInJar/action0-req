@@ -2,6 +2,7 @@
 
 from enum import StrEnum
 from typing import Any
+from typing import Mapping
 from typing import Union
 
 from action0.url import Params
@@ -86,6 +87,7 @@ class Request:
         headers: Union[HeaderTypes, None] = None,
         body: Union[BodyTypes, None] = None,
         http_version: str = "HTTP/1.1",
+        meta: Union[Mapping[str, Any], None] = None,
     ) -> None:
         """
         :param url: the URL to request, as a string or an existing
@@ -102,6 +104,8 @@ class Request:
                      :py:class:`~action0.req.body.BodyProducer`
         :param http_version: the protocol version rendered in the request
                              line
+        :param meta: initial application metadata riding along with the
+                     request (see :py:attr:`meta`)
         """
         if url is None:
             self.url = Url()
@@ -118,6 +122,13 @@ class Request:
         self.headers = Headers(headers)
         self.body: Union[BodyTypes, None] = body
         self.http_version = http_version
+        self.meta: dict[str, Any] = dict(meta) if meta is not None else {}
+        """Application metadata riding along with the request — correlation
+        ids, tracing context, per-request knobs for custom backends, ... —
+        never sent on the wire and not part of :py:meth:`__eq__`. The dict
+        is the request's own (the constructor copies the given mapping);
+        libraries should namespace their keys (e.g.
+        ``"my-lib.correlation-id"``)."""
 
     def body_bytes(self) -> Union[bytes, None]:
         """
@@ -155,10 +166,11 @@ class Request:
 
     def copy(self, **overrides: Any) -> "Request":
         """
-        An independent copy of this request (with its own ``Url`` and
-        ``Headers`` instances), optionally with attributes replaced. The
-        body is carried over as-is — in particular a
-        :py:class:`~action0.req.body.BodyProducer` is shared, not copied.
+        An independent copy of this request (with its own ``Url``,
+        ``Headers`` and ``meta`` dict), optionally with attributes
+        replaced. The body is carried over as-is — in particular a
+        :py:class:`~action0.req.body.BodyProducer` is shared, not copied;
+        the ``meta`` values are shared too (shallow copy).
 
         Example::
 
@@ -175,6 +187,7 @@ class Request:
             "headers": self.headers,
             "body": self.body,
             "http_version": self.http_version,
+            "meta": self.meta,
         }
         kwargs.update(overrides)
         return Request(**kwargs)
@@ -217,7 +230,8 @@ class Request:
         Requests are equal when their method, URL, headers, body and HTTP
         version are equal, each with the part's own equality semantics
         (e.g. header name casing doesn't matter). The body is compared as
-        set: ``b"x"`` and ``"x"`` are different bodies.
+        set: ``b"x"`` and ``"x"`` are different bodies. The
+        :py:attr:`meta` dict is metadata and not compared.
 
         :param other: the Request to compare with
         :return: whether the requests are equal
