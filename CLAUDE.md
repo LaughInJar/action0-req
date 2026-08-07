@@ -9,6 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Rules
 
 - **Never commit without asking.** Also never push, tag, or publish on your own.
+- **Branches + PRs.** All changes go through feature branches and GitHub pull requests that Simon reviews and merges — never commit to `main` directly. (Only the initial implementation was built directly on `main`; that phase is over.)
 - **Discuss first.** Always present the plan and the intended edits and get agreement before changing files.
 - Every code change comes with: tests, docstrings, inline comments where the code isn't self-explanatory, and updated usage examples in `README.md` and the Sphinx docs (`docs/usage.md`).
 - Before considering work done, run ruff, mypy, and pytest (commands below) and fix what they report.

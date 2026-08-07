@@ -46,7 +46,10 @@ headers.add("Set-Cookie", "a=1")
 headers.add("set-cookie", "b=2")
 print(headers["CONTENT-TYPE"])  # text/html
 print(headers.get_all("Set-Cookie"))  # ['a=1', 'b=2']
-print(headers.as_str())  # Content-Type: text/html\r\nSet-Cookie: a=1\r\nset-cookie: b=2
+print(headers.as_str(separator="\n"))  # "\r\n" by default
+# Content-Type: text/html
+# Set-Cookie: a=1
+# set-cookie: b=2
 
 # repr()/str() redact secrets, only as_str() renders them
 print(Headers({"Authorization": "Bearer tok"}))  # Headers(Authorization: ***)
@@ -61,8 +64,10 @@ from action0.req import Request
 
 req = Request("https://api.example.com/items", query={"page": 2})
 req.headers["Accept"] = "application/json"
-print(req.as_str())
-# GET /items?page=2 HTTP/1.1\r\nHost: api.example.com\r\nAccept: application/json
+print(req.as_str(separator="\n"))  # "\r\n" by default
+# GET /items?page=2 HTTP/1.1
+# Host: api.example.com
+# Accept: application/json
 
 post = req.copy(method="POST", body='{"a": 1}')
 print(post.body_bytes())  # b'{"a": 1}'
@@ -77,8 +82,9 @@ from action0.req import Response, Status
 
 resp = Response(Status.NOT_FOUND, headers={"Content-Type": "text/plain"}, body="not here")
 print(resp.phrase, resp.is_client_error)  # Not Found True
-print(resp.as_str())
-# HTTP/1.1 404 Not Found\r\nContent-Type: text/plain
+print(resp.as_str(separator="\n"))  # "\r\n" by default
+# HTTP/1.1 404 Not Found
+# Content-Type: text/plain
 ```
 
 ## Installation
