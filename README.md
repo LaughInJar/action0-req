@@ -123,6 +123,15 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
+## AI-assisted development
+
+In the spirit of transparency: most of this project's code, tests and
+documentation are written by [Claude Code](https://claude.com/claude-code),
+Anthropic's coding agent — under human direction and review. The designs
+are specified, discussed and iterated by a human, and every change is
+reviewed before it lands in `main` or in a release. AI-authored commits
+carry a `Co-Authored-By: Claude ...` trailer.
+
 ## About action0
 
 This is just the namespace I like to use for my personal projects.
