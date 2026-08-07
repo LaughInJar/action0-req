@@ -13,12 +13,10 @@ Requires Python 3.11 or newer.
 Full documentation including the API reference:
 <https://laughinjar.github.io/action0-req/>
 
-**Status: under construction.** `Headers`, `Request`, the body streaming
-interface (`BodyProducer` / `BytesBody`) and the header name, status code
-and method constants exist; still planned:
+**Status: under construction.** `Headers`, `Request`, `Response`, the
+body streaming interface (`BodyProducer` / `BytesBody`) and the header
+name, status code and method constants exist; still planned:
 
-- `action0.req.response.Response` — every part (status, headers, body) a
-  plain attribute.
 - More body producers for streaming: file- and (async-)iterable-backed.
 
 ## Usage
@@ -70,6 +68,18 @@ print(req.as_str())
 post = req.copy(method="POST", body='{"a": 1}')
 print(post.body_bytes())  # b'{"a": 1}'
 print(post)  # Request(POST https://api.example.com/items?page=2)
+```
+
+`Response` mirrors it for the server side — status (with reason phrase
+fallback and category properties), headers, body:
+
+```python
+from action0.req import Response, Status
+
+resp = Response(Status.NOT_FOUND, headers={"Content-Type": "text/plain"}, body="not here")
+print(resp.phrase, resp.is_client_error)  # Not Found True
+print(resp.as_str())
+# HTTP/1.1 404 Not Found\r\nContent-Type: text/plain
 ```
 
 ## Installation

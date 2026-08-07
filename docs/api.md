@@ -3,7 +3,8 @@
 The public constants and classes are importable from the package root:
 
 ```python
-from action0.req import BodyProducer, BytesBody, Header, Headers, Method, Request, Status
+from action0.req import Header, Headers, Method, Request, Response, Status
+from action0.req import BodyProducer, BytesBody
 ```
 
 ## Headers and Header
@@ -19,6 +20,15 @@ from action0.req import BodyProducer, BytesBody, Header, Headers, Method, Reques
 
 ```{eval-rst}
 .. automodule:: action0.req.request
+   :members:
+   :undoc-members:
+   :special-members: __eq__, __repr__
+```
+
+## Response
+
+```{eval-rst}
+.. automodule:: action0.req.response
    :members:
    :undoc-members:
    :special-members: __eq__, __repr__

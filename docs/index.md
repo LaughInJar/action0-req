@@ -25,8 +25,9 @@ still to come):
   and HTTP version as plain attributes, with typed body accessors
   (`body_bytes()` / `body_str()` / `body_producer()`), `copy()` with
   overrides and a wire-format `as_str()`.
-- `Response` — every part (status, headers, body) a plain attribute
-  *(planned)*.
+- {py:class}`~action0.req.response.Response` — status (with reason
+  phrase fallback and category properties), headers, body and an
+  optional back-reference to the request, mirroring `Request`.
 - Streaming of request and response bodies via the
   {py:class}`~action0.req.body.BodyProducer` protocol — sync and async;
   file- and iterable-backed producers *(planned)*.

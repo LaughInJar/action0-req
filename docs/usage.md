@@ -221,3 +221,55 @@ print(req.as_str(include_body=True, separator="\n"))
 #
 # <BytesBody>
 ```
+
+## Responses
+
+{py:class}`~action0.req.response.Response` mirrors `Request` for the
+server side: status, headers, body and HTTP version as plain attributes,
+with the same three body accessors. The status takes any int —
+{py:class}`~action0.req.status.Status` members included — and the
+{py:attr}`~action0.req.response.Response.phrase` falls back to the
+registry when the server didn't send its own reason:
+
+```python
+from action0.req import Response, Status
+
+resp = Response(Status.NOT_FOUND, headers={"Content-Type": "text/plain"}, body="not here")
+print(resp.status, resp.phrase)
+# 404 Not Found
+print(resp.is_client_error, resp.is_success)
+# True False
+print(resp.as_str(include_body=True, separator="\n"))
+# HTTP/1.1 404 Not Found
+# Content-Type: text/plain
+#
+# not here
+```
+
+An explicitly set reason wins over the registry, and unregistered codes
+simply have no phrase (the category properties still work for them):
+
+```python
+from action0.req import Response
+
+print(Response(404, reason="Nope"))
+# Response(404 Nope)
+print(Response(599).as_str())
+# HTTP/1.1 599
+print(Response(599).is_server_error)
+# True
+```
+
+A response can reference the request that produced it — metadata that is
+shared, not copied, and ignored by equality:
+
+```python
+from action0.req import Request, Response
+
+req = Request("https://api.example.com/items")
+resp = Response(200, request=req)
+print(resp.request)
+# Request(GET https://api.example.com/items)
+print(resp == Response(200))
+# True
+```

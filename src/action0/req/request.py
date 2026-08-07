@@ -9,15 +9,15 @@ from action0.url import Url
 from action0.url.params import ParamTypes
 
 from .body import BodyProducer
-from .body import BytesBody
+from .body import BodyTypes
+from .body import _body_bytes
+from .body import _body_producer
+from .body import _body_str
+from .body import _charset
+from .body import _rendered_body
 from .headers import Header
 from .headers import Headers
 from .headers import HeaderTypes
-
-BodyTypes = Union[bytes, str, BodyProducer]
-"""Everything a request (or response) accepts as body: raw bytes, text
-(encoded with the Content-Type charset when accessed as bytes), or a
-streaming :py:class:`~action0.req.body.BodyProducer`."""
 
 
 class Method(StrEnum):
@@ -119,18 +119,6 @@ class Request:
         self.body: Union[BodyTypes, None] = body
         self.http_version = http_version
 
-    def _charset(self) -> str:
-        """
-        :return: the charset parameter of the Content-Type header,
-                 ``"utf-8"`` if there is none
-        """
-        content_type = self.headers.get(Header.CONTENT_TYPE, "")
-        for parameter in content_type.split(";")[1:]:
-            name, sep, value = parameter.partition("=")
-            if sep and name.strip().lower() == "charset":
-                return value.strip().strip('"') or "utf-8"
-        return "utf-8"
-
     def body_bytes(self) -> Union[bytes, None]:
         """
         The body as bytes, regardless of how it was set: bytes are
@@ -140,13 +128,7 @@ class Request:
 
         :return: the body bytes, ``None`` if there is no body
         """
-        if self.body is None:
-            return None
-        if isinstance(self.body, bytes):
-            return self.body
-        if isinstance(self.body, str):
-            return self.body.encode(self._charset())
-        return self.body.as_bytes()
+        return _body_bytes(self.body, _charset(self.headers))
 
     def body_str(self) -> Union[str, None]:
         """
@@ -157,13 +139,7 @@ class Request:
 
         :return: the body text, ``None`` if there is no body
         """
-        if self.body is None:
-            return None
-        if isinstance(self.body, str):
-            return self.body
-        if isinstance(self.body, bytes):
-            return self.body.decode(self._charset())
-        return self.body.as_bytes().decode(self._charset())
+        return _body_str(self.body, _charset(self.headers))
 
     def body_producer(self) -> Union[BodyProducer, None]:
         """
@@ -175,13 +151,7 @@ class Request:
 
         :return: the body producer, ``None`` if there is no body
         """
-        if self.body is None:
-            return None
-        if isinstance(self.body, bytes):
-            return BytesBody(self.body)
-        if isinstance(self.body, str):
-            return BytesBody(self.body.encode(self._charset()))
-        return self.body
+        return _body_producer(self.body, _charset(self.headers))
 
     def copy(self, **overrides: Any) -> "Request":
         """
@@ -238,11 +208,7 @@ class Request:
         rendered = separator.join(lines)
 
         if include_body and self.body is not None:
-            if isinstance(self.body, (bytes, str)):
-                body_text = self.body_str()
-            else:
-                # a producer may be consumable only once — don't drain it here
-                body_text = f"<{type(self.body).__name__}>"
+            body_text = _rendered_body(self.body, _charset(self.headers))
             rendered = f"{rendered}{separator}{separator}{body_text}"
         return rendered
 
