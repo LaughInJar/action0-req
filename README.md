@@ -13,11 +13,10 @@ Requires Python 3.11 or newer.
 Full documentation including the API reference:
 <https://laughinjar.github.io/action0-req/>
 
-**Status: under construction.** `Headers`, `Request`, `Response`, the
-body streaming interface (`BodyProducer` / `BytesBody`) and the header
-name, status code and method constants exist; still planned:
-
-- More body producers for streaming: file- and (async-)iterable-backed.
+**Status:** the core API is complete — the header name, status code and
+method constants, the `Headers` mapping, `Request` and `Response`, and
+sync/async body streaming via `BodyProducer` (`BytesBody`, `FileBody`,
+`IterableBody`, `AsyncIterableBody`).
 
 ## Usage
 

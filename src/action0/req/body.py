@@ -1,6 +1,12 @@
 """Streaming abstractions for request and response bodies."""
 
+import asyncio
+import io
+import os
+from typing import IO
+from typing import AsyncIterable
 from typing import AsyncIterator
+from typing import Iterable
 from typing import Iterator
 from typing import Protocol
 from typing import Union
@@ -95,6 +101,208 @@ class BytesBody:
         :return: the body bytes
         """
         return self._data
+
+
+def _open_binary(path: Union[str, "os.PathLike[str]"]) -> IO[bytes]:
+    """
+    Open a file for binary reading.
+
+    A typed wrapper: passing the built-in ``open`` through
+    :py:func:`asyncio.to_thread` loses the overload selection and with it
+    the precise ``IO[bytes]`` return type.
+
+    :param path: the path of the file to open
+    :return: the opened binary file object
+    """
+    return open(path, "rb")
+
+
+class FileBody:
+    """
+    A :py:class:`BodyProducer` streaming a file in chunks.
+
+    The source can be a path or an already-open binary file object:
+
+    - A path is opened freshly for every iteration, so the body is
+      re-iterable (e.g. for retries) and no file descriptor is held
+      between uses.
+    - A file object is used as-is and never closed by this class. If it
+      is seekable it is rewound to the start for every iteration (making
+      it re-iterable too); if not, reading starts at the current position
+      and the body is consumable only once.
+
+    :py:meth:`achunks` performs every blocking file operation in the
+    default thread pool via :py:func:`asyncio.to_thread`, so the event
+    loop is never stalled — without any extra dependency.
+    """
+
+    def __init__(
+        self,
+        source: Union[str, "os.PathLike[str]", IO[bytes]],
+        chunk_size: int = 65536,
+    ) -> None:
+        """
+        :param source: the path of the file to stream, or an open binary
+                       file object
+        :param chunk_size: the number of bytes per chunk
+        :raises ValueError: if the chunk size is not positive
+        """
+        if chunk_size <= 0:
+            raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+        if isinstance(source, (str, os.PathLike)):
+            self._path: Union[str, "os.PathLike[str]", None] = source
+            self._file: Union[IO[bytes], None] = None
+        else:
+            self._path = None
+            self._file = source
+        self._chunk_size = chunk_size
+
+    def content_length(self) -> Union[int, None]:
+        """
+        :return: the size of the file; for a non-seekable file object
+                 ``None`` (unknown)
+        """
+        if self._path is not None:
+            return os.stat(self._path).st_size
+        assert self._file is not None
+        if not self._file.seekable():
+            return None
+        # measure the full size, leaving the current position untouched
+        position = self._file.tell()
+        size = self._file.seek(0, io.SEEK_END)
+        self._file.seek(position)
+        return size
+
+    def chunks(self) -> Iterator[bytes]:
+        """
+        :return: the file contents as an iterator of chunks of (up to)
+                 the configured chunk size
+        """
+        if self._path is not None:
+            with open(self._path, "rb") as file:
+                while chunk := file.read(self._chunk_size):
+                    yield chunk
+            return
+        assert self._file is not None
+        if self._file.seekable():
+            self._file.seek(0)
+        while chunk := self._file.read(self._chunk_size):
+            yield chunk
+
+    async def achunks(self) -> AsyncIterator[bytes]:
+        """
+        :return: the file contents as an asynchronous iterator of chunks;
+                 all file operations run in the default thread pool
+        """
+        if self._path is not None:
+            opened = await asyncio.to_thread(_open_binary, self._path)
+            try:
+                while chunk := await asyncio.to_thread(opened.read, self._chunk_size):
+                    yield chunk
+            finally:
+                await asyncio.to_thread(opened.close)
+            return
+        file = self._file
+        assert file is not None
+        if await asyncio.to_thread(file.seekable):
+            await asyncio.to_thread(file.seek, 0)
+        while chunk := await asyncio.to_thread(file.read, self._chunk_size):
+            yield chunk
+
+    def as_bytes(self) -> bytes:
+        """
+        :return: the whole file contents
+        """
+        return b"".join(self.chunks())
+
+
+class IterableBody:
+    """
+    A :py:class:`BodyProducer` wrapping an iterable of byte chunks, e.g.
+    a generator. The total length is unknown (:py:meth:`content_length`
+    is ``None`` — such a body would be sent chunked).
+
+    WARNING: if the iterable is a generator (or any other single-use
+    iterable), the body can be consumed only once — also by
+    :py:meth:`as_bytes`. Pass a list of chunks for a re-iterable body.
+    """
+
+    def __init__(self, iterable: Iterable[bytes]) -> None:
+        """
+        :param iterable: the byte chunks of the body
+        """
+        self._iterable = iterable
+
+    def content_length(self) -> Union[int, None]:
+        """
+        :return: always ``None``, the length is unknown in advance
+        """
+        return None
+
+    def chunks(self) -> Iterator[bytes]:
+        """
+        :return: the chunks as given by the wrapped iterable
+        """
+        yield from self._iterable
+
+    async def achunks(self) -> AsyncIterator[bytes]:
+        """
+        :return: the chunks as given by the wrapped (synchronous) iterable
+        """
+        for chunk in self._iterable:
+            yield chunk
+
+    def as_bytes(self) -> bytes:
+        """
+        :return: all chunks joined (consumes a single-use iterable)
+        """
+        return b"".join(self._iterable)
+
+
+class AsyncIterableBody:
+    """
+    A :py:class:`BodyProducer` wrapping an asynchronous iterable of byte
+    chunks, e.g. an async generator proxying another stream. The total
+    length is unknown (:py:meth:`content_length` is ``None``).
+
+    An asynchronous source is async-only: the synchronous accessors
+    :py:meth:`chunks` and :py:meth:`as_bytes` raise a
+    :py:class:`RuntimeError` — consume the body with :py:meth:`achunks`.
+    Like a generator, an async generator source is consumable only once.
+    """
+
+    def __init__(self, aiterable: AsyncIterable[bytes]) -> None:
+        """
+        :param aiterable: the byte chunks of the body
+        """
+        self._aiterable = aiterable
+
+    def content_length(self) -> Union[int, None]:
+        """
+        :return: always ``None``, the length is unknown in advance
+        """
+        return None
+
+    def chunks(self) -> Iterator[bytes]:
+        """
+        :raises RuntimeError: always — an async body has no synchronous
+                              chunks; use :py:meth:`achunks`
+        """
+        raise RuntimeError("an async body cannot be read synchronously; use achunks()")
+
+    async def achunks(self) -> AsyncIterator[bytes]:
+        """
+        :return: the chunks as given by the wrapped asynchronous iterable
+        """
+        async for chunk in self._aiterable:
+            yield chunk
+
+    def as_bytes(self) -> bytes:
+        """
+        :raises RuntimeError: always — an async body has no synchronous
+                              bytes view; use :py:meth:`achunks`
+        """
+        raise RuntimeError("an async body cannot be read synchronously; use achunks()")
 
 
 BodyTypes = Union[bytes, str, BodyProducer]

@@ -2,10 +2,6 @@
 
 Everything here is runnable as-is; the `#` comments show the exact output.
 
-The library is under construction — this guide grows together with the
-API (`Headers`, `Request`, `Response`, the header and status constants,
-and body streaming).
-
 ## Installation
 
 `action0-req` is not published to PyPI yet; install it straight from
@@ -206,8 +202,7 @@ print(req.as_str(include_body=True, separator="\n"))
 A `BodyProducer` body is streamed in chunks — synchronously via
 `chunks()` or asynchronously via `achunks()`; `as_str(include_body=True)`
 never consumes it and shows a placeholder instead. `BytesBody` is the
-in-memory implementation; file- and iterable-backed producers are
-planned:
+in-memory implementation:
 
 ```python
 from action0.req import BytesBody, Request
@@ -220,6 +215,78 @@ print(req.as_str(include_body=True, separator="\n"))
 # Host: api.example.com
 #
 # <BytesBody>
+```
+
+## Streaming bodies
+
+Besides {py:class}`~action0.req.body.BytesBody` there are three
+streaming producers. {py:class}`~action0.req.body.FileBody` streams a
+file in chunks; given a path it opens the file freshly per iteration, so
+the body is re-iterable (a seekable open file object works too and is
+rewound per iteration; a non-seekable one is consumed once):
+
+```python
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from action0.req import FileBody
+
+with TemporaryDirectory() as tmp:
+    path = Path(tmp) / "upload.bin"
+    path.write_bytes(b"abcdef")
+    body = FileBody(path, chunk_size=4)
+    print(body.content_length())
+    # 6
+    print(list(body.chunks()))
+    # [b'abcd', b'ef']
+    print(list(body.chunks()))  # re-iterable
+    # [b'abcd', b'ef']
+```
+
+{py:class}`~action0.req.body.IterableBody` wraps any iterable of byte
+chunks — e.g. a generator (then single-use); the length is unknown, such
+a body would be sent chunked:
+
+```python
+from action0.req import IterableBody, Request
+
+
+def generate():
+    yield b"chunk1"
+    yield b"chunk2"
+
+
+req = Request("https://api.example.com/upload", "PUT", body=IterableBody(generate()))
+print(req.body_producer().content_length())
+# None
+print(req.body_bytes())  # reads the stream — consumes a generator source
+# b'chunk1chunk2'
+```
+
+{py:class}`~action0.req.body.AsyncIterableBody` wraps an asynchronous
+iterable — e.g. an async generator proxying another stream. It is
+async-only: the synchronous `chunks()`/`as_bytes()` raise a
+`RuntimeError`. Every producer supports `achunks()` for asynchronous
+consumption (`FileBody` runs its file operations in the default thread
+pool, so the event loop is never blocked):
+
+```python
+import asyncio
+
+from action0.req import AsyncIterableBody
+
+
+async def generate():
+    yield b"async"
+    yield b"chunks"
+
+
+async def main():
+    return [chunk async for chunk in AsyncIterableBody(generate()).achunks()]
+
+
+print(asyncio.run(main()))
+# [b'async', b'chunks']
 ```
 
 ## Responses

@@ -9,8 +9,7 @@ the URL representation.
 uv add action0-req    # not on PyPI yet — install from GitHub for now
 ```
 
-**Highlights** (the library is under construction — the class layer is
-still to come):
+**Highlights**:
 
 - {py:class}`~action0.req.headers.Header`,
   {py:class}`~action0.req.status.Status` and
@@ -29,8 +28,9 @@ still to come):
   phrase fallback and category properties), headers, body and an
   optional back-reference to the request, mirroring `Request`.
 - Streaming of request and response bodies via the
-  {py:class}`~action0.req.body.BodyProducer` protocol — sync and async;
-  file- and iterable-backed producers *(planned)*.
+  {py:class}`~action0.req.body.BodyProducer` protocol — sync and async
+  (without blocking the event loop), with in-memory, file-backed and
+  (async-)iterable-backed producers.
 - Fully typed (checked with mypy strict, pyright and ty), Python 3.11+,
   no runtime dependencies beyond `action0-url`.
 
