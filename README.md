@@ -13,15 +13,31 @@ Requires Python 3.11 or newer.
 Full documentation including the API reference:
 <https://laughinjar.github.io/action0-req/>
 
-**Status: under construction.** The planned API:
+**Status: under construction.** The header name, status code and method
+constants exist; still planned:
 
 - `action0.req.headers.Headers` — a case-insensitive, multi-value aware
   mapping of HTTP header fields.
 - `action0.req.request.Request` and `action0.req.response.Response` —
   every part (method, URL, status, headers, body) a plain attribute.
-- Constants for common HTTP header names and the known status codes.
 - Optional streaming of request and response bodies — sync and async,
   convenience and performance focused.
+
+## Usage
+
+`Header`, `Status` and `Method` are `StrEnum`/`IntEnum` constants for the
+IANA-registered header field names, status codes and request methods —
+every member *is* its string or integer value:
+
+```python
+from action0.req import Header, Method, Status
+
+print(Header.CONTENT_TYPE)  # Content-Type
+print(Method.POST)  # POST
+print(Status.NOT_FOUND)  # 404
+print(Status.NOT_FOUND.phrase)  # Not Found
+print(Status.NOT_FOUND.is_client_error)  # True
+```
 
 ## Installation
 

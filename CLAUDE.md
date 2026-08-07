@@ -40,10 +40,10 @@ uv build               # build sdist + wheel into dist/
 
 The package is being built up module by module under `src/action0/req/`. Planned/current layout:
 
-- `headers.py` — `Headers`: case-insensitive, multi-value aware mapping of HTTP header fields (planned).
-- `request.py` — `Request`: method, URL (`action0.url.Url`), headers, body (planned).
+- `headers.py` — `Header`: `StrEnum` of the IANA HTTP field name registry (permanent + deprecated + provisional registrations, generated from the registry CSV on 2026-08-07) plus a block of unregistered de-facto `X-…` names. `Headers`, the case-insensitive multi-value mapping class, will join this module (planned).
+- `status.py` — `Status`: custom `IntEnum` of the IANA status code registry with `phrase` and `is_informational`/`is_success`/`is_redirection`/`is_client_error`/`is_server_error` properties. Deliberately not `http.HTTPStatus`: the stdlib's code list and category properties vary across 3.11–3.15. Two pre-RFC-9110 aliases (`PAYLOAD_TOO_LARGE`, `UNPROCESSABLE_ENTITY`).
+- `request.py` — `Method`: `StrEnum` of the RFC 9110 verbs + `PATCH` + `QUERY`. `Request` (method, URL as `action0.url.Url`, headers, body) will join this module (planned).
 - `response.py` — `Response`: status, headers, body (planned).
-- Constants for common HTTP header names and known status codes (planned).
 - Optional sync/async streaming of request and response bodies (planned).
 
 Conventions:

@@ -9,15 +9,20 @@ the URL representation.
 uv add action0-req    # not on PyPI yet — install from GitHub for now
 ```
 
-**Planned highlights** (the library is under construction):
+**Highlights** (the library is under construction — the class layer is
+still to come):
 
+- {py:class}`~action0.req.headers.Header`,
+  {py:class}`~action0.req.status.Status` and
+  {py:class}`~action0.req.request.Method` — `StrEnum`/`IntEnum` constants
+  for the IANA-registered header field names, status codes (with reason
+  phrases and category properties) and request methods.
 - `Headers` — a case-insensitive, multi-value aware mapping of HTTP
-  header fields, plus constants for the common header names.
+  header fields *(planned)*.
 - `Request` / `Response` — every part (method, URL, status, headers,
-  body) a plain attribute; parse once, change what you need.
-- Constants for the known HTTP status codes and common headers.
+  body) a plain attribute; parse once, change what you need *(planned)*.
 - Optional streaming of request and response bodies — sync and async,
-  convenience and performance focused.
+  convenience and performance focused *(planned)*.
 - Fully typed (checked with mypy strict, pyright and ty), Python 3.11+,
   no runtime dependencies beyond `action0-url`.
 
