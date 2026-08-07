@@ -68,7 +68,7 @@ docs = [
 [[package]]
 name = "action0-url"
 version = "0.1.0"
-source = { git = "https://github.com/LaughInJar/action0-url?branch=main#deb9481b77f576dc2dec533222b94026d59d5adb" }
+source = { git = "https://github.com/LaughInJar/action0-url?branch=main#588f200aee4366c088d40fa1cbae0b7a904cd062" }
 
 [[package]]
 name = "alabaster"
