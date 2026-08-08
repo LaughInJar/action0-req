@@ -4,11 +4,8 @@ Everything here is runnable as-is; the `#` comments show the exact output.
 
 ## Installation
 
-`action0-req` is not published to PyPI yet; install it straight from
-GitHub:
-
 ```shell
-uv add "action0-req @ git+https://github.com/LaughInJar/action0-req"
+pip install action0-req  # or uv add action0-req
 ```
 
 ## Constants

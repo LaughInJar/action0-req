@@ -10,7 +10,7 @@ from .request import Request
 from .response import Response
 from .status import Status
 
-__version__: str = "0.1.0"
+__version__: str = "0.1.1"
 
 __all__ = [
     "AsyncIterableBody",

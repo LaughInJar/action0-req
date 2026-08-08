@@ -18,6 +18,13 @@ method constants, the `Headers` mapping, `Request` and `Response`, and
 sync/async body streaming via `BodyProducer` (`BytesBody`, `FileBody`,
 `IterableBody`, `AsyncIterableBody`).
 
+
+## Installation
+
+```shell
+pip install action0-req  # or uv add action0-req
+```
+
 ## Usage
 
 `Header`, `Status` and `Method` are `StrEnum`/`IntEnum` constants for the
@@ -85,14 +92,6 @@ print(resp.phrase, resp.is_client_error)  # Not Found True
 print(resp.as_str(separator="\n"))  # "\r\n" by default
 # HTTP/1.1 404 Not Found
 # Content-Type: text/plain
-```
-
-## Installation
-
-Not published to PyPI yet; install straight from GitHub:
-
-```shell
-uv add "action0-req @ git+https://github.com/LaughInJar/action0-req"
 ```
 
 ## Development
