@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`action0-req` is a Python library for representing, creating and manipulating HTTP requests and responses. It ships the `action0.req` package (`action0` is a PEP 420 namespace package) from a `src/` layout, is built with hatchling, and uses `uv` for environment/dependency management. Its only runtime dependency is `action0-url` (the URL representation), which is not on PyPI yet and is resolved from GitHub via `[tool.uv.sources]`.
+`action0-req` is a Python library for representing, creating and manipulating HTTP requests and responses. It ships the `action0.req` package (`action0` is a PEP 420 namespace package) from a `src/` layout, is built with hatchling, and uses `uv` for environment/dependency management. Its only runtime dependency is `action0-url` (the URL representation), pulled from PyPI.
 
 ## Rules
 
