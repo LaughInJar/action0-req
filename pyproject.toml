@@ -10,7 +10,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
-    "action0-url",
+    "action0-url>=0.1.0",
 ]
 keywords = ["http", "request", "response", "headers", "status", "manipulation"]
 classifiers = [
@@ -33,11 +33,6 @@ Homepage = "https://github.com/LaughInJar/action0-req"
 Documentation = "https://laughinjar.github.io/action0-req/"
 Source = "https://github.com/LaughInJar/action0-req"
 Issues = "https://github.com/LaughInJar/action0-req/issues"
-
-# action0-url is not on PyPI yet — resolve it from GitHub for now
-# (uv.lock pins the exact commit; `uv lock --upgrade` moves it forward)
-[tool.uv.sources]
-action0-url = { git = "https://github.com/LaughInJar/action0-url", branch = "main" }
 
 [dependency-groups]
 dev = [
