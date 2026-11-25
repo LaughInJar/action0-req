@@ -4,7 +4,7 @@ All notable changes to action0-req are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the version
 numbers follow [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 0.2.0 — 2026-11-26
 
 ### Added
 

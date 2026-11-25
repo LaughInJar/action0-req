@@ -136,8 +136,8 @@ matches `__version__`, builds sdist + wheel and publishes to PyPI via
 trusted publishing:
 
 ```shell
-git tag v0.1.0
-git push origin v0.1.0
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
 ## AI-assisted development
