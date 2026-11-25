@@ -21,7 +21,8 @@ numbers follow [Semantic Versioning](https://semver.org/).
   `save_body()` and `asave_body()`: copy a body into a path or an open
   file object chunk by chunk, with `append=True` for resumed downloads.
   A path is opened only once the body has delivered its first chunk, so
-  a body that cannot be read leaves an existing file untouched.
+  a body that cannot be read leaves an existing file untouched. A write
+  that fails closes the stream.
 - `Response.close()` and `Response.aclose()`; a response is now a sync
   and async context manager. They release what the body holds and do
   nothing for in-memory bodies.
@@ -29,6 +30,8 @@ numbers follow [Semantic Versioning](https://semver.org/).
   a callback releasing the resource behind the stream. It runs exactly
   once: after the body has been consumed, when a consumer stops early,
   or on `close()` / `aclose()`. Both classes are context managers.
+  Closing also closes a generator behind the body, so one that was read
+  in part runs its `finally` blocks right away.
   `AsyncIterableBody.close()` is the synchronous counterpart for a body
   with nothing left to release; it raises while the callback is pending.
 - trio support for asynchronous file I/O: `FileBody.achunks()` and the
@@ -39,8 +42,11 @@ numbers follow [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- `FileBody.achunks()` closes the file it opened also when the consuming
-  task is cancelled repeatedly, as anyio does on a timeout.
+- `FileBody.achunks()` no longer leaves its file open when the consuming
+  task is cancelled. On asyncio the file operation under way in the
+  worker thread is now finished before the cancellation is passed on,
+  instead of being abandoned, and the file is closed also when the task
+  is cancelled repeatedly, as anyio does on a timeout.
 
 ## 0.1.1 — 2026-08-08
 
