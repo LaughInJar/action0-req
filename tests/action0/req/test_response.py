@@ -22,6 +22,26 @@ from action0.req import body as body_module
 from action0.req import response as response_module
 
 
+class _Stream:
+    """
+    A minimal third-party producer streaming two chunks; the tests add
+    the ``close()`` or ``aclose()`` they are about.
+    """
+
+    def content_length(self) -> None:
+        return None
+
+    def chunks(self) -> Iterator[bytes]:
+        yield b"chunk1"
+        yield b"chunk2"
+
+    async def achunks(self) -> AsyncIterator[bytes]:
+        yield b"chunk1chunk2"  # pragma: no cover
+
+    def as_bytes(self) -> bytes:
+        return b"chunk1chunk2"
+
+
 class ResponseInitTestCase(unittest.TestCase):
     """
     tests for :py:meth:`action0.req.response.Response.__init__`
@@ -383,6 +403,31 @@ class ResponseBodyFileTestCase(unittest.TestCase):
             self.assertTrue(file.closed)
             resp.close()
 
+    def test_closing_the_file_of_a_path_body_does_no_harm(self) -> None:
+        """
+        Test that the body of a path-based FileBody stays readable when
+        the file handed out is closed — the obvious thing to do with a
+        file — and that the next call opens a new one, which closing the
+        response closes.
+        """
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "cached.bin"
+            path.write_bytes(b"abcdef")
+            with Response(200, body=FileBody(path)) as resp:
+                file = resp.body_file()
+                assert file is not None
+                with file:
+                    self.assertEqual(file.read(), b"abcdef")
+                self.assertEqual(resp.body_bytes(), b"abcdef")
+
+                again = resp.body_file()
+                assert again is not None
+                self.assertIsNot(again, file)
+                self.assertEqual(again.read(), b"abcdef")
+            self.assertTrue(again.closed)
+            # like any path-based FileBody: closing holds nothing back
+            self.assertEqual(resp.body_bytes(), b"abcdef")
+
     def test_file_body_over_a_seekable_file_object(self) -> None:
         """
         Test that a FileBody wrapping a seekable file object hands out
@@ -466,6 +511,55 @@ class ResponseBodyFileTestCase(unittest.TestCase):
             self.assertIsInstance(resp.body, SpooledBody)
             self.assertEqual(connection.closed, 1)
         self.assertEqual(connection.closed, 1)
+
+    def test_async_only_producer_is_released_by_aclose(self) -> None:
+        """
+        Test that a producer which can only be closed asynchronously is
+        not lost when the spool replaces it: close() refuses as before,
+        and aclose() releases the producer (once) and the spool.
+        """
+
+        class _AsyncConnection(_Stream):
+            released = 0
+
+            async def aclose(self) -> None:
+                self.released += 1
+
+        connection = _AsyncConnection()
+        resp = Response(200, body=connection)
+        file = resp.body_file()
+        assert file is not None
+        self.assertEqual(file.read(), b"chunk1chunk2")
+        self.assertIsInstance(resp.body, SpooledBody)
+
+        with self.assertRaises(RuntimeError):
+            resp.close()
+        self.assertFalse(file.closed)
+        self.assertEqual(connection.released, 0)
+
+        asyncio.run(resp.aclose())
+        asyncio.run(resp.aclose())
+        self.assertEqual(connection.released, 1)
+        self.assertTrue(file.closed)
+        resp.close()
+
+    def test_producer_failing_to_close(self) -> None:
+        """
+        Test that the error of a producer's close() reaches the caller
+        with the response in order: it holds the spool, readable and
+        closable.
+        """
+
+        class _Flaky(_Stream):
+            def close(self) -> None:
+                raise ConnectionError("reset")
+
+        resp = Response(200, body=_Flaky())
+        with self.assertRaises(ConnectionError):
+            resp.body_file()
+        self.assertIsInstance(resp.body, SpooledBody)
+        self.assertEqual(resp.body_bytes(), b"chunk1chunk2")
+        resp.close()
 
     def test_broken_stream_leaves_nothing_behind(self) -> None:
         """
@@ -684,9 +778,10 @@ class ResponseCloseTestCase(unittest.TestCase):
     def test_context_manager_does_not_replace_the_error(self) -> None:
         """
         Test that a ``with`` block left by an exception raises that
-        exception also when the body can only be closed asynchronously —
-        while leaving it normally does report the body that is still
-        open.
+        exception also when the body refuses to be closed synchronously —
+        with the refusal attached as a note — while leaving the block
+        normally does report the body that is still open. That holds for
+        any producer following the convention, not only the built-in.
         """
 
         async def source() -> AsyncIterator[bytes]:
@@ -695,16 +790,33 @@ class ResponseCloseTestCase(unittest.TestCase):
         async def release() -> None:
             pass  # pragma: no cover
 
-        def streamed() -> Response:
-            return Response(200, body=AsyncIterableBody(source(), aclose=release))
+        class _Refusing(BytesBody):
+            def close(self) -> None:
+                raise RuntimeError("still streaming; use aclose()")
 
-        with self.assertRaises(KeyError):
-            with streamed():
-                raise KeyError("boom")
+            async def aclose(self) -> None:
+                pass  # pragma: no cover
 
-        with self.assertRaises(RuntimeError):
-            with streamed():
-                pass
+        class _AsyncOnly(BytesBody):
+            async def aclose(self) -> None:
+                pass  # pragma: no cover
+
+        bodies = (
+            lambda: AsyncIterableBody(source(), aclose=release),
+            lambda: _Refusing(b"data"),
+            lambda: _AsyncOnly(b"data"),
+        )
+        for body in bodies:
+            with self.subTest(body=type(body()).__name__):
+                with self.assertRaises(KeyError) as raised:
+                    with Response(200, body=body()):
+                        raise KeyError("boom")
+                (note,) = raised.exception.__notes__
+                self.assertIn("closing the response failed as well", note)
+
+                with self.assertRaises(RuntimeError):
+                    with Response(200, body=body()):
+                        pass
 
     def test_context_manager(self) -> None:
         """

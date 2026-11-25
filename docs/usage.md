@@ -325,6 +325,12 @@ with body:
 body.close()  # no effect: the callback has run
 ```
 
+Closing the body also closes a generator behind it, ahead of the
+callback: a generator that was read only in part gets to run its own
+`finally` blocks right away instead of at garbage collection. A body
+over a generator cannot be read after it has been closed; one over a
+list is not affected.
+
 ### Spooled bodies
 
 {py:class}`~action0.req.body.SpooledBody` is the producer for a body
@@ -448,9 +454,10 @@ a seekable binary file object — for consumers that read from a file,
 like streaming parsers or decompressors. For an in-memory body that is
 an in-memory file; a {py:class}`~action0.req.body.SpooledBody` hands out
 its own file; a {py:class}`~action0.req.body.FileBody` hands out the
-file it wraps, or opens its path once — nothing is copied, and the
-opened file is closed with the response; and a streamed body is read to
-its end into a new
+file it wraps, or opens its path once — nothing is copied, the opened
+file is closed with the response, and closing it yourself does no harm
+(the next call opens it again); and a streamed body is read to its end
+into a new
 `SpooledBody`, which then replaces `resp.body`, so the response stays
 readable. The stream it replaces has delivered everything and is closed,
 which releases its connection:
@@ -471,6 +478,10 @@ with resp:  # closing the response discards the spooled data
     print(type(resp.body).__name__)
     # SpooledBody
 ```
+
+The replacement happens in this response only. A `copy()` made before
+shares the original stream, which is used up afterwards — as it is after
+any other read of a streamed body.
 
 ### Saving a response body
 
@@ -515,12 +526,14 @@ If the body breaks off midway, the exception passes through and what
 has arrived is in the file — its size is the offset to resume from. A
 path is opened only once the body has delivered its first chunk: a body
 that cannot be read at all (already closed, failing right away) raises
-without creating or truncating the file.
+without creating or truncating the file. If it is the write that fails
+(a full disk), the stream is closed, which releases its connection.
 
 {py:meth}`~action0.req.response.Response.asave_body` is the asynchronous
 twin: it reads the body via `achunks()` and does every file operation in
-a worker thread, writing small chunks 64 KiB at a time. When the task is
-cancelled midway (a timeout), what has arrived is still written and the
+a worker thread, writing small chunks 64 KiB at a time. A cancellation
+(a timeout) does not tear anything apart: a write that is under way is
+finished, and once the file is open, what has arrived is written and the
 file closed before the cancellation is passed on. Both exist as
 functions too ({py:func}`~action0.req.body.save_body`,
 {py:func}`~action0.req.body.asave_body`), for a body that is not part of
@@ -556,7 +569,8 @@ them. A body that can only be closed asynchronously (an
 `AsyncIterableBody` with an `aclose` callback) makes `close()` raise a
 `RuntimeError` instead of silently leaving the resource open. A `with`
 block left by an exception passes that exception on instead: the error
-that happened first is the one to see.
+that happened first is the one to see, and the failure to close is
+attached to it as a note.
 
 ### Pickling
 
