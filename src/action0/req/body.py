@@ -3,6 +3,7 @@
 import asyncio
 import functools
 import io
+import itertools
 import os
 import sys
 import tempfile
@@ -157,6 +158,56 @@ async def _in_thread(function: Callable[_P, _T], *args: _P.args, **kwargs: _P.kw
     return await asyncio.to_thread(function, *args, **kwargs)
 
 
+async def _in_thread_shielded(
+    function: Callable[_P, _T], *args: _P.args, **kwargs: _P.kwargs
+) -> _T:
+    """
+    :py:func:`_in_thread` for cleanup that must not be skipped — closing
+    a file, writing out what has arrived: the function runs to its end
+    even if the calling task is cancelled (a timeout, a failing sibling
+    task). The cancellation is not swallowed, only postponed: it is
+    raised once the function has returned.
+
+    A cleanup typically runs *because* of a cancellation. trio then
+    refuses to start anything in the cancelled scope, and so does anyio
+    on asyncio, which keeps cancelling a task until it has left the
+    scope.
+
+    :param function: the blocking function
+    :param args: its positional arguments
+    :param kwargs: its keyword arguments
+    :return: what the function returned
+    :raises RuntimeError: if called outside of asyncio and trio
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        trio = sys.modules.get("trio")
+        if trio is None:
+            raise
+        call = functools.partial(function, *args, **kwargs)
+        # the pending cancellation is delivered at the first checkpoint
+        # after the shielded scope
+        with trio.CancelScope(shield=True):
+            return cast("_T", await trio.to_thread.run_sync(call))
+    future = asyncio.ensure_future(asyncio.to_thread(function, *args, **kwargs))
+    cancelled: Union[asyncio.CancelledError, None] = None
+    while not future.done():
+        try:
+            # shield() keeps the cancellation of this task away from the
+            # future; waiting again is what makes the function finish
+            # before anything else happens to the file it works on
+            await asyncio.shield(future)
+        except asyncio.CancelledError as error:
+            cancelled = error
+        except Exception:
+            # the function's own error: raised by result() below
+            pass
+    if cancelled is not None:
+        raise cancelled
+    return future.result()
+
+
 def _open_binary(path: Union[str, "os.PathLike[str]"], mode: str = "rb") -> IO[bytes]:
     """
     Open a file in a binary mode.
@@ -256,7 +307,9 @@ class FileBody:
                 while chunk := await _in_thread(opened.read, self._chunk_size):
                     yield chunk
             finally:
-                await _in_thread(opened.close)
+                # shielded: the handle is closed also when the consumer
+                # was cancelled
+                await _in_thread_shielded(opened.close)
             return
         file = self._file
         assert file is not None
@@ -270,6 +323,56 @@ class FileBody:
         :return: the whole file contents
         """
         return b"".join(self.chunks())
+
+
+class _OpenedFileBody(FileBody):
+    """
+    A :py:class:`FileBody` over a file it has opened itself, and which it
+    therefore closes: what :py:meth:`Response.body_file()
+    <action0.req.response.Response.body_file>` replaces a path-based
+    ``FileBody`` with. The plain class cannot do that — it holds no file
+    between two uses of a path, and never closes a file object it was
+    given.
+    """
+
+    def __init__(self, path: Union[str, "os.PathLike[str]"], chunk_size: int) -> None:
+        """
+        :param path: the path of the file, which is opened right away
+        :param chunk_size: the number of bytes per chunk
+        """
+        super().__init__(_open_binary(path), chunk_size)
+
+    def close(self) -> None:
+        """
+        Close the file. Safe to call any number of times; the body cannot
+        be read afterwards.
+        """
+        assert self._file is not None
+        self._file.close()
+
+
+def _file_of(body: FileBody) -> Union[tuple[FileBody, IO[bytes]], None]:
+    """
+    The seekable file object behind a :py:class:`FileBody`, so that
+    nobody has to copy a file in order to get a file.
+
+    :param body: the body to look into
+    :return: the body to go on with and its file, rewound to the start —
+             the given body if it wraps a seekable file object; for a
+             path a new body that has opened the file and closes it in
+             its ``close()``. ``None`` if the file is not seekable
+    """
+    if body._path is not None:
+        body = _OpenedFileBody(body._path, body._chunk_size)
+    file = body._file
+    assert file is not None
+    if not file.seekable():
+        if isinstance(body, _OpenedFileBody):
+            # a path leading to a pipe or the like: not kept open
+            body.close()
+        return None
+    file.seek(0)
+    return body, file
 
 
 class IterableBody:
@@ -442,6 +545,20 @@ class AsyncIterableBody:
         """
         raise RuntimeError("an async body cannot be read synchronously; use achunks()")
 
+    def close(self) -> None:
+        """
+        The synchronous counterpart of :py:meth:`aclose`, for code that
+        closes bodies without knowing their kind: it does nothing if
+        there is nothing (left) to release — no ``aclose`` callback, or
+        one that has run already.
+
+        :raises RuntimeError: if the ``aclose`` callback is still to run:
+                              it can only be awaited — use
+                              :py:meth:`aclose`
+        """
+        if self._aclose is not None:
+            raise RuntimeError("an async body cannot be closed synchronously; use aclose()")
+
     async def aclose(self) -> None:
         """
         Release the resource behind the body by awaiting the ``aclose``
@@ -472,6 +589,48 @@ class AsyncIterableBody:
         Close the body, see :py:meth:`aclose`.
         """
         await self.aclose()
+
+
+def _closes_async_only(body: object) -> bool:
+    """
+    :param body: the body of a response, in any form
+    :return: whether the body holds something that only an awaited
+             ``aclose()`` can release
+    """
+    if isinstance(body, AsyncIterableBody):
+        # its close() exists, but refuses while the callback is pending
+        return body._aclose is not None
+    return callable(getattr(body, "aclose", None)) and not callable(getattr(body, "close", None))
+
+
+class _Spool(tempfile.SpooledTemporaryFile[bytes]):
+    """
+    The file behind a :py:class:`SpooledBody`: a
+    :py:class:`tempfile.SpooledTemporaryFile` that tells whether it has
+    been rolled over to a real file.
+
+    The standard library keeps that state private, and it does not only
+    change when the body asks for it: ``fileno()`` and ``truncate(size)``
+    — called by whoever was handed the file — roll over too. They all go
+    through :py:meth:`rollover`, so this is the one place that knows.
+    """
+
+    #: whether the data has been moved from memory to a temporary file
+    rolled = False
+
+    def rollover(self) -> None:
+        """
+        Move the data from memory to a temporary file; does nothing if
+        that has happened already.
+
+        :raises ValueError: if the file is closed
+        """
+        if self.closed:
+            # the standard library would create the temporary file first
+            # and fail afterwards — leaving a closed spool reopened
+            raise ValueError("I/O operation on closed file")
+        super().rollover()
+        self.rolled = True
 
 
 class SpooledBody:
@@ -545,21 +704,16 @@ class SpooledBody:
         # The mode is "r+b" rather than the default "w+b" for the sake of
         # consumers that look at the ``mode`` attribute of a file they
         # are given: gzip.GzipFile(fileobj=...) would open for writing
-        spool = tempfile.SpooledTemporaryFile(
-            max_size=0, mode="r+b", dir=None if dir is None else os.fspath(dir)
-        )
-        self._file: IO[bytes] = spool
-        self._rollover = spool.rollover
+        self._file = _Spool(max_size=0, mode="r+b", dir=None if dir is None else os.fspath(dir))
         self._size = 0
-        self._rolled = False
-        # False while a reader may have moved the file position
-        self._at_end = True
 
     @property
     def rolled(self) -> bool:
         """Whether the data has been moved from memory to the temporary
-        file."""
-        return self._rolled
+        file. Besides a write exceeding ``max_memory`` this happens when
+        a consumer of :py:meth:`file` asks for a file descriptor
+        (``fileno()``)."""
+        return self._file.rolled
 
     @property
     def closed(self) -> bool:
@@ -575,14 +729,18 @@ class SpooledBody:
         :return: the number of bytes written (all of them)
         :raises ValueError: if the body is closed
         """
-        if not self._at_end:
-            # a reader has been here: appending must not overwrite
-            self._file.seek(0, io.SEEK_END)
-            self._at_end = True
-        if not self._rolled and self._size + len(data) > self._max_memory:
-            self._rollover()
-            self._rolled = True
-        self._file.write(data)
+        file = self._file
+        if file.closed:
+            raise ValueError("I/O operation on closed file")
+        if not file.rolled and self._size + len(data) > self._max_memory:
+            file.rollover()
+        # the readers (file(), chunks()) share this file object and leave
+        # its position wherever they stopped: an append goes to the end.
+        # Compared with tell() rather than always seeking, because a seek
+        # would flush the write buffer of the temporary file every time
+        if file.tell() != self._size:
+            file.seek(self._size)
+        file.write(data)
         self._size += len(data)
         return len(data)
 
@@ -600,7 +758,7 @@ class SpooledBody:
         :return: the number of bytes written (all of them)
         :raises ValueError: if the body is closed
         """
-        if not self._rolled and self._size + len(data) <= self._max_memory:
+        if not self._file.rolled and self._size + len(data) <= self._max_memory:
             return self.write(data)
         return await _in_thread(self.write, data)
 
@@ -618,7 +776,6 @@ class SpooledBody:
         :raises ValueError: if the body is closed
         """
         self._file.seek(0)
-        self._at_end = False
         return self._file
 
     def content_length(self) -> Union[int, None]:
@@ -642,7 +799,7 @@ class SpooledBody:
                  chunks; once the data is in the temporary file, all file
                  operations run in a worker thread
         """
-        if not self._rolled:
+        if not self._file.rolled:
             # still in memory: nothing here can block
             for chunk in self.chunks():
                 yield chunk
@@ -669,10 +826,11 @@ class SpooledBody:
     async def aclose(self) -> None:
         """
         Like :py:meth:`close`, without blocking the event loop: removing
-        a temporary file is file I/O and runs in a worker thread.
+        a temporary file is file I/O and runs in a worker thread — also
+        when the calling task has been cancelled.
         """
-        if self._rolled and not self._file.closed:
-            await _in_thread(self._file.close)
+        if self._file.rolled and not self._file.closed:
+            await _in_thread_shielded(self._file.close)
         else:
             self._file.close()
 
@@ -736,6 +894,10 @@ def save_body(
     resuming a download relies on: the size of the file is the offset to
     continue from.
 
+    A path is opened only once the body has delivered its first chunk: a
+    body that cannot be read at all (closed, async-only, failing right
+    away) raises without creating or truncating the file.
+
     :param body: the body to copy, as bytes or as a producer
     :param target: a path — the file is created or truncated, or appended
                    to with ``append=True``, and closed afterwards — or a
@@ -745,10 +907,14 @@ def save_body(
                    write behind them. Has no effect for a file object
     :return: the number of bytes written
     """
-    if isinstance(target, (str, os.PathLike)):
-        with _open_binary(target, "ab" if append else "wb") as file:
-            return _write_chunks(file, body)
-    return _write_chunks(target, body)
+    chunks: Iterator[bytes] = iter((body,) if isinstance(body, bytes) else body.chunks())
+    if not isinstance(target, (str, os.PathLike)):
+        return _write_chunks(target, chunks)
+    # before the file is touched: what is in it must survive a body that
+    # turns out to be unreadable
+    first = next(chunks, b"")
+    with _open_binary(target, "ab" if append else "wb") as file:
+        return _write_chunks(file, itertools.chain((first,), chunks))
 
 
 async def asave_body(
@@ -764,6 +930,10 @@ async def asave_body(
     chunks are collected and written 64 KiB at a time, which bounds the
     number of thread hops.
 
+    When the task is cancelled midway (a timeout), what has arrived is
+    still written and the file closed before the cancellation is passed
+    on.
+
     :param body: the body to copy, as bytes or as a producer
     :param target: a path or a binary file object, as for
                    :py:func:`save_body`
@@ -771,70 +941,112 @@ async def asave_body(
                    write behind them. Has no effect for a file object
     :return: the number of bytes written
     """
-    if isinstance(target, (str, os.PathLike)):
-        file = await _in_thread(_open_binary, target, "ab" if append else "wb")
-        try:
-            return await _awrite_chunks(file, body)
-        finally:
-            await _in_thread(file.close)
-    return await _awrite_chunks(target, body)
+    chunks = _achunks(body)
+    if not isinstance(target, (str, os.PathLike)):
+        return await _awrite_chunks(target, chunks)
+    # before the file is touched, as in save_body()
+    first = await anext(chunks, b"")
+    file = await _in_thread(_open_binary, target, "ab" if append else "wb")
+    try:
+        return await _awrite_chunks(file, chunks, first)
+    finally:
+        await _in_thread_shielded(file.close)
 
 
-def _write_chunks(file: IO[bytes], body: Union[bytes, BodyProducer]) -> int:
+def _achunks(body: Union[bytes, BodyProducer]) -> AsyncIterator[bytes]:
     """
-    Write a body to an open file object.
-
-    :param file: the binary file object to write to
-    :param body: the body, as bytes or as a producer
-    :return: the number of bytes written
+    :param body: a body, as bytes or as a producer
+    :return: its chunks as an asynchronous iterator; bytes are a single
+             chunk
     """
     if isinstance(body, bytes):
-        file.write(body)
-        return len(body)
+        return _one_chunk(body)
+    return aiter(body.achunks())
+
+
+async def _one_chunk(data: bytes) -> AsyncIterator[bytes]:
+    """
+    :param data: the bytes of a body
+    :return: an asynchronous iterator producing them as a single chunk
+    """
+    yield data
+
+
+def _write_all(file: IO[bytes], data: bytes) -> None:
+    """
+    Write all of the data to a file object. A buffered file takes
+    everything in one call; a raw (unbuffered) file, pipe or socket may
+    take only a part, and says so with the number it returns — the rest
+    is then written in further calls.
+
+    :param file: the binary file object to write to
+    :param data: the bytes to write
+    :raises OSError: if the file takes no data at all
+    """
+    # None is not in the signature of IO.write(), but it is what many a
+    # file-like object returns: taken as "everything written"
+    written = cast("Union[int, None]", file.write(data))
+    while written is not None and written < len(data):
+        if written <= 0:
+            raise OSError("the file did not accept any data")
+        data = data[written:]
+        written = cast("Union[int, None]", file.write(data))
+
+
+def _write_chunks(file: IO[bytes], chunks: Iterable[bytes]) -> int:
+    """
+    Write the chunks of a body to an open file object.
+
+    :param file: the binary file object to write to
+    :param chunks: the chunks of the body
+    :return: the number of bytes written
+    """
     written = 0
-    for chunk in body.chunks():
-        file.write(chunk)
+    for chunk in chunks:
+        _write_all(file, chunk)
         written += len(chunk)
     return written
 
 
-async def _awrite_chunks(file: IO[bytes], body: Union[bytes, BodyProducer]) -> int:
+async def _awrite_chunks(file: IO[bytes], chunks: AsyncIterator[bytes], first: bytes = b"") -> int:
     """
-    Write a body to an open file object, doing the writes in a worker
-    thread and batching small chunks.
+    Write the chunks of a body to an open file object, doing the writes
+    in a worker thread and batching small chunks.
 
     :param file: the binary file object to write to
-    :param body: the body, as bytes or as a producer
+    :param chunks: the chunks of the body
+    :param first: a chunk taken off the body beforehand, written ahead of
+                  the others
     :return: the number of bytes written
     """
-    if isinstance(body, bytes):
-        await _in_thread(file.write, body)
-        return len(body)
-
     written = 0
-    pending: list[bytes] = []
-    pending_size = 0
+    pending: list[bytes] = [first] if first else []
+    pending_size = len(first)
 
-    async def flush() -> None:
+    async def flush(*, shielded: bool = False) -> None:
         nonlocal written, pending, pending_size
         # hand the batch over before writing: if the write fails, the
         # ``finally`` below must not write the same bytes a second time
         batch, size = pending, pending_size
         pending, pending_size = [], 0
-        await _in_thread(file.writelines, batch)
+        if shielded:
+            await _in_thread_shielded(_write_chunks, file, batch)
+        else:
+            await _in_thread(_write_chunks, file, batch)
         written += size
 
     try:
-        async for chunk in body.achunks():
+        async for chunk in chunks:
             pending.append(chunk)
             pending_size += len(chunk)
             if pending_size >= _WRITE_BATCH:
                 await flush()
     finally:
         # also when the body broke off: what has arrived belongs in the
-        # file, a resumed download continues behind it
+        # file, a resumed download continues behind it. Shielded, because
+        # "broke off" includes this task being cancelled
         if pending:
-            await flush()
+            await flush(shielded=True)
     return written
 
 

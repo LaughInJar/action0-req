@@ -5,8 +5,8 @@ import io
 import json
 import sys
 import threading
-import types
 import unittest
+from collections.abc import AsyncGenerator
 from collections.abc import AsyncIterator
 from collections.abc import Callable
 from collections.abc import Generator
@@ -17,6 +17,8 @@ from typing import IO
 from typing import Any
 from typing import cast
 from unittest import mock
+
+import trio
 
 from action0.req import AsyncIterableBody
 from action0.req import BodyProducer
@@ -48,13 +50,21 @@ def _recorded_thread_hops() -> Iterator[list[str]]:
     blocks the event loop and what does not.
     """
     hops: list[str] = []
-    real = body_module._in_thread
 
-    async def recording(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        hops.append(getattr(function, "__name__", repr(function)))
-        return await real(function, *args, **kwargs)
+    def recording(real: Callable[..., Any]) -> Callable[..., Any]:
+        async def dispatch(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+            hops.append(getattr(function, "__name__", repr(function)))
+            return await real(function, *args, **kwargs)
 
-    with mock.patch.object(body_module, "_in_thread", recording):
+        return dispatch
+
+    # the plain dispatch and the one for cleanup that survives cancellation
+    with (
+        mock.patch.object(body_module, "_in_thread", recording(body_module._in_thread)),
+        mock.patch.object(
+            body_module, "_in_thread_shielded", recording(body_module._in_thread_shielded)
+        ),
+    ):
         yield hops
 
 
@@ -71,6 +81,37 @@ class _ReadOnlyStream:
 
     def seekable(self) -> bool:
         return False
+
+
+class _RawTarget:
+    """
+    A write target behaving like a raw (unbuffered) file or a pipe: every
+    ``write()`` takes a few bytes only and returns how many.
+    """
+
+    def __init__(self, accepts: int = 3) -> None:
+        self.data = b""
+        self.calls = 0
+        self._accepts = accepts
+
+    def write(self, data: bytes) -> int:
+        self.calls += 1
+        taken = data[: self._accepts]
+        self.data += taken
+        return len(taken)
+
+
+class _SilentTarget:
+    """
+    A file-like write target whose ``write()`` returns nothing — common
+    among hand-written ones.
+    """
+
+    def __init__(self) -> None:
+        self.data = b""
+
+    def write(self, data: bytes) -> None:
+        self.data += data
 
 
 class BytesBodyTestCase(unittest.TestCase):
@@ -445,6 +486,22 @@ class AsyncIterableBodyCloseTestCase(unittest.IsolatedAsyncioTestCase):
         await body.aclose()
         self.assertEqual([chunk async for chunk in body.achunks()], [b"a", b"b"])
 
+    async def test_sync_close(self) -> None:
+        """
+        Test that the synchronous close() refuses while the callback is
+        still to run — it cannot be awaited there — and does nothing when
+        there is nothing (left) to release.
+        """
+        AsyncIterableBody(self._source()).close()
+
+        body = AsyncIterableBody(self._source(), aclose=self._release)
+        with self.assertRaises(RuntimeError):
+            body.close()
+        self.assertEqual(self.closed, [])
+        await body.aclose()
+        body.close()
+        self.assertEqual(self.closed, ["closed"])
+
 
 class SpooledBodyTestCase(unittest.TestCase):
     """
@@ -533,6 +590,37 @@ class SpooledBodyTestCase(unittest.TestCase):
                 self.assertEqual(body.as_bytes(), b"abcdef")
                 self.assertEqual(body.content_length(), 6)
 
+    def test_write_after_reading_an_earlier_file_handle(self) -> None:
+        """
+        Test that an append goes to the end also when the position was
+        moved through a file handle obtained before the previous write —
+        file() hands out the body's own file object, so every handle
+        moves the same position.
+        """
+        for max_memory in (1024, 0):
+            with self.subTest(max_memory=max_memory), SpooledBody(max_memory=max_memory) as body:
+                body.write(b"aaaa")
+                file = body.file()
+                body.write(b"bbbb")
+                file.seek(0)
+                self.assertEqual(file.read(2), b"aa")
+                body.write(b"cc")
+                self.assertEqual(body.as_bytes(), b"aaaabbbbcc")
+                self.assertEqual(body.content_length(), 10)
+
+    def test_rolled_follows_a_rollover_by_the_file(self) -> None:
+        """
+        Test that the body notices when the file moves to disk on its
+        own: asking the file object for a descriptor does that.
+        """
+        with SpooledBody() as body:
+            body.write(b"abc")
+            self.assertFalse(body.rolled)
+            self.assertIsInstance(body.file().fileno(), int)
+            self.assertTrue(body.rolled)
+            body.write(b"def")
+            self.assertEqual(body.as_bytes(), b"abcdef")
+
     def test_file_feeds_gzip_and_json(self) -> None:
         """
         Test the use cases the file view exists for: a decompressor and a
@@ -591,6 +679,35 @@ class SpooledBodyTestCase(unittest.TestCase):
             body.file()
         with self.assertRaises(ValueError):
             body.as_bytes()
+
+    def test_write_to_a_closed_body_leaves_it_closed(self) -> None:
+        """
+        Test that a write to a closed body raises every time and leaves
+        it closed — also the write that would move the data to a file:
+        no temporary file may be created for a body that is gone.
+        """
+        for max_memory in (1024, 4, 0):
+            with self.subTest(max_memory=max_memory):
+                body = SpooledBody(max_memory=max_memory)
+                body.close()
+                for _ in range(2):
+                    with self.assertRaises(ValueError):
+                        body.write(b"abcdef")
+                    self.assertTrue(body.closed)
+                    self.assertFalse(body.rolled)
+                self.assertEqual(body.content_length(), 0)
+
+    def test_file_descriptor_of_a_closed_body(self) -> None:
+        """
+        Test that asking the file of a closed body for a descriptor
+        raises without reopening it.
+        """
+        body = SpooledBody()
+        file = body.file()
+        body.close()
+        with self.assertRaises(ValueError):
+            file.fileno()
+        self.assertTrue(body.closed)
 
     def test_closing_the_file_closes_the_body(self) -> None:
         """
@@ -679,6 +796,22 @@ class SpooledBodyAsyncTestCase(unittest.IsolatedAsyncioTestCase):
             await body.awrite(b"abc")
         self.assertTrue(body.closed)
 
+    async def test_threads_are_used_after_a_rollover_by_the_file(self) -> None:
+        """
+        Test that once the file has moved to disk on its own (a consumer
+        asked for its descriptor), writing, reading and closing run in
+        worker threads like after a rollover by size.
+        """
+        body = SpooledBody()
+        await body.awrite(b"abc")
+        body.file().fileno()
+        with _recorded_thread_hops() as hops:
+            await body.awrite(b"def")
+            chunks = [chunk async for chunk in body.achunks()]
+            await body.aclose()
+        self.assertEqual(chunks, [b"abcdef"])
+        self.assertEqual(hops, ["write", "file", "read", "read", "close"])
+
 
 class InThreadTestCase(unittest.TestCase):
     """
@@ -702,26 +835,22 @@ class InThreadTestCase(unittest.TestCase):
         self.assertNotEqual(thread, threading.get_ident())
         self.assertEqual(result, 3)
 
-    def test_trio_is_used_without_an_asyncio_loop(self) -> None:
+    def test_trio_runs_in_another_thread(self) -> None:
         """
-        Test that with no running asyncio loop an imported trio gets the
-        call: its ``to_thread.run_sync`` is awaited with the bound
-        function. (trio itself is not a dependency — a stand-in module
-        and a hand-driven coroutine do.)
+        Test that below trio — no running asyncio loop, trio imported —
+        the function runs in a worker thread of trio and its result (and
+        arguments) pass through.
         """
-        calls: list[Callable[[], Any]] = []
 
-        async def run_sync(function: Callable[[], Any]) -> Any:
-            calls.append(function)
-            return function()
+        def work(base: int, *, extra: int) -> tuple[int, int]:
+            return threading.get_ident(), base + extra
 
-        trio = types.SimpleNamespace(to_thread=types.SimpleNamespace(run_sync=run_sync))
-        with mock.patch.dict(sys.modules, {"trio": trio}):
-            coroutine = body_module._in_thread(int, "7", base=8)
-            with self.assertRaises(StopIteration) as finished:
-                coroutine.send(None)
-        self.assertEqual(finished.exception.value, 7)
-        self.assertEqual(len(calls), 1)
+        async def main() -> tuple[int, int]:
+            return await body_module._in_thread(work, 1, extra=2)
+
+        thread, result = trio.run(main)
+        self.assertNotEqual(thread, threading.get_ident())
+        self.assertEqual(result, 3)
 
     def test_outside_any_event_loop(self) -> None:
         """
@@ -730,9 +859,152 @@ class InThreadTestCase(unittest.TestCase):
         """
         with mock.patch.dict(sys.modules):
             sys.modules.pop("trio", None)
-            coroutine = body_module._in_thread(int, "7")
-            with self.assertRaises(RuntimeError):
-                coroutine.send(None)
+            for dispatch in (body_module._in_thread, body_module._in_thread_shielded):
+                coroutine = dispatch(int, "7")
+                with self.assertRaises(RuntimeError):
+                    coroutine.send(None)
+
+
+class InThreadShieldedTestCase(unittest.TestCase):
+    """
+    tests for :py:func:`action0.req.body._in_thread_shielded`, the
+    dispatch for cleanup that has to run although the task is cancelled
+    """
+
+    def test_result_and_error_pass_through(self) -> None:
+        """
+        Test that without any cancellation it behaves like the plain
+        dispatch, on asyncio and on trio: the result is returned, an
+        error of the function is raised.
+        """
+
+        async def main() -> int:
+            with self.assertRaises(ValueError):
+                await body_module._in_thread_shielded(int, "x")
+            return await body_module._in_thread_shielded(int, "7", base=8)
+
+        self.assertEqual(asyncio.run(main()), 7)
+        self.assertEqual(trio.run(main), 7)
+
+    def test_asyncio_cancellation_waits_for_the_function(self) -> None:
+        """
+        Test that cancelling the task — even repeatedly, as anyio does —
+        neither stops the function nor gets lost: the task ends cancelled
+        once the function has finished.
+        """
+        started = threading.Event()
+        release = threading.Event()
+        finished: list[bool] = []
+
+        def work() -> None:
+            started.set()
+            release.wait(10)
+            finished.append(True)
+
+        async def main() -> None:
+            task = asyncio.ensure_future(body_module._in_thread_shielded(work))
+            await asyncio.to_thread(started.wait, 10)
+            for _ in range(3):
+                task.cancel()
+                await asyncio.sleep(0)
+            self.assertFalse(task.done())
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertEqual(finished, [True])
+
+        asyncio.run(main())
+
+    def test_trio_runs_in_a_cancelled_scope(self) -> None:
+        """
+        Test that below trio the function runs although the surrounding
+        scope is cancelled already — where trio refuses to start a plain
+        worker thread — and that the cancellation is delivered after it.
+        """
+        finished: list[bool] = []
+
+        async def main() -> bool:
+            with trio.CancelScope() as scope:
+                scope.cancel()
+                await body_module._in_thread_shielded(finished.append, True)
+                await trio.lowlevel.checkpoint()
+                self.fail("the cancellation got lost")  # pragma: no cover
+            return scope.cancelled_caught
+
+        self.assertTrue(trio.run(main))
+        self.assertEqual(finished, [True])
+
+
+class TrioCancellationTestCase(unittest.TestCase):
+    """
+    tests for the cleanup of the asynchronous file operations when a trio
+    scope is cancelled — a timeout is the everyday case
+    """
+
+    def setUp(self) -> None:
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "download.bin"
+
+    def test_asave_body_writes_what_arrived_and_closes(self) -> None:
+        """
+        Test that a download running into a timeout leaves what has
+        arrived in the file, and the file closed.
+        """
+
+        async def stalling() -> AsyncIterator[bytes]:
+            yield b"abc"
+            await trio.sleep_forever()
+
+        async def main() -> bool:
+            with trio.move_on_after(0.05) as scope:
+                await asave_body(AsyncIterableBody(stalling()), self.path)
+            return scope.cancelled_caught
+
+        with _recorded_thread_hops() as hops:
+            self.assertTrue(trio.run(main))
+        self.assertEqual(hops, ["_open_binary", "_write_chunks", "close"])
+        self.assertEqual(self.path.read_bytes(), b"abc")
+
+    def test_spooled_body_is_closed(self) -> None:
+        """
+        Test that ``async with`` removes the temporary file of a spooled
+        body also when the block is left by a timeout.
+        """
+        bodies: list[SpooledBody] = []
+
+        async def main() -> bool:
+            with trio.move_on_after(0.05) as scope:
+                async with SpooledBody(max_memory=0) as body:
+                    bodies.append(body)
+                    await body.awrite(b"abc")
+                    await trio.sleep_forever()
+            return scope.cancelled_caught
+
+        self.assertTrue(trio.run(main))
+        self.assertTrue(bodies[0].closed)
+
+    def test_file_body_closes_its_file(self) -> None:
+        """
+        Test that a path-based FileBody closes the file it opened when
+        its consumer runs into a timeout.
+        """
+        self.path.write_bytes(b"abcdef")
+
+        async def main() -> bool:
+            # achunks() is annotated as a plain iterator; it is a generator
+            generator = cast(
+                "AsyncGenerator[bytes, None]", FileBody(self.path, chunk_size=4).achunks()
+            )
+            with trio.move_on_after(0.05) as scope:
+                async with contextlib.aclosing(generator) as chunks:
+                    async for _chunk in chunks:
+                        await trio.sleep_forever()
+            return scope.cancelled_caught
+
+        with _recorded_thread_hops() as hops:
+            self.assertTrue(trio.run(main))
+        self.assertEqual(hops, ["_open_binary", "read", "close"])
 
 
 class SaveBodyTestCase(unittest.TestCase):
@@ -805,6 +1077,80 @@ class SaveBodyTestCase(unittest.TestCase):
         save_body(body, self.path)
         self.assertEqual(closed, [True])
 
+    def test_unreadable_body_leaves_the_file_alone(self) -> None:
+        """
+        Test that a body which cannot deliver anything raises before the
+        path is opened: an existing file keeps its contents, a missing
+        one is not created.
+        """
+
+        async def source() -> AsyncIterator[bytes]:
+            yield b"new"  # pragma: no cover
+
+        def failing() -> Iterator[bytes]:
+            raise ConnectionResetError("gone")
+            yield b"new"  # pragma: no cover
+
+        closed = SpooledBody()
+        closed.close()
+        # factories: a generator source fails only the first time it is read
+        bodies: list[tuple[Callable[[], BodyProducer], type[Exception]]] = [
+            (lambda: AsyncIterableBody(source()), RuntimeError),
+            (lambda: closed, ValueError),
+            (lambda: IterableBody(failing()), ConnectionResetError),
+        ]
+        for body, error in bodies:
+            with self.subTest(error=error.__name__):
+                self.path.write_bytes(b"precious")
+                with self.assertRaises(error):
+                    save_body(body(), self.path)
+                self.assertEqual(self.path.read_bytes(), b"precious")
+                self.path.unlink()
+                with self.assertRaises(error):
+                    save_body(body(), self.path)
+                self.assertFalse(self.path.exists())
+
+    def test_empty_body_still_replaces_the_file(self) -> None:
+        """
+        Test that a body which is readable but empty truncates (or
+        creates) the file like any other.
+        """
+        for body in (b"", IterableBody([])):
+            with self.subTest(body=type(body).__name__):
+                self.path.write_bytes(b"old contents")
+                self.assertEqual(save_body(body, self.path), 0)
+                self.assertEqual(self.path.read_bytes(), b"")
+
+    def test_short_writes_are_completed(self) -> None:
+        """
+        Test that a target taking only a part of the data per write — a
+        raw file, a pipe — gets all of it nevertheless.
+        """
+        target = _RawTarget(accepts=3)
+        written = save_body(IterableBody([b"abcdefgh", b"ij"]), cast("IO[bytes]", target))
+        self.assertEqual(written, 10)
+        self.assertEqual(target.data, b"abcdefghij")
+        self.assertEqual(target.calls, 4)
+
+    def test_write_returning_nothing_counts_as_complete(self) -> None:
+        """
+        Test that a file-like target whose write() returns ``None`` is
+        written once per chunk.
+        """
+        target = _SilentTarget()
+        self.assertEqual(save_body(IterableBody([b"abc", b"def"]), cast("IO[bytes]", target)), 6)
+        self.assertEqual(target.data, b"abcdef")
+
+    def test_target_accepting_nothing_raises(self) -> None:
+        """
+        Test that a target which takes no data at all raises instead of
+        being retried forever.
+        """
+        target = _RawTarget(accepts=0)
+        with self.assertRaises(OSError):
+            save_body(b"abc", cast("IO[bytes]", target))
+        self.assertEqual(target.calls, 1)
+
 
 class AsyncSaveBodyTestCase(unittest.IsolatedAsyncioTestCase):
     """
@@ -824,7 +1170,7 @@ class AsyncSaveBodyTestCase(unittest.IsolatedAsyncioTestCase):
         with _recorded_thread_hops() as hops:
             self.assertEqual(await asave_body(b"abc", self.path), 3)
         self.assertEqual(self.path.read_bytes(), b"abc")
-        self.assertEqual(hops, ["_open_binary", "write", "close"])
+        self.assertEqual(hops, ["_open_binary", "_write_chunks", "close"])
 
     async def test_append_to_path(self) -> None:
         """
@@ -862,7 +1208,7 @@ class AsyncSaveBodyTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(written, 102400)
         self.assertEqual(self.path.read_bytes(), chunk * 10)
         # 7 chunks reach the 64 KiB batch size, the other 3 follow at the end
-        self.assertEqual(hops, ["_open_binary", "writelines", "writelines", "close"])
+        self.assertEqual(hops, ["_open_binary", "_write_chunks", "_write_chunks", "close"])
 
     async def test_broken_stream_keeps_what_arrived(self) -> None:
         """
@@ -888,7 +1234,7 @@ class AsyncSaveBodyTestCase(unittest.IsolatedAsyncioTestCase):
         class _FullDisk(io.BytesIO):
             attempts = 0
 
-            def writelines(self, lines: Any) -> None:
+            def write(self, data: Any) -> int:
                 type(self).attempts += 1
                 raise OSError("no space left on device")
 
@@ -896,3 +1242,49 @@ class AsyncSaveBodyTestCase(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(OSError):
             await asave_body(IterableBody([b"x" * 70000, b"y"]), target)
         self.assertEqual(_FullDisk.attempts, 1)
+
+    async def test_unreadable_body_leaves_the_file_alone(self) -> None:
+        """
+        Test that a body which cannot deliver anything raises before the
+        path is opened: an existing file keeps its contents, a missing
+        one is not created.
+        """
+
+        async def failing() -> AsyncIterator[bytes]:
+            raise ConnectionResetError("gone")
+            yield b"new"  # pragma: no cover
+
+        closed = SpooledBody()
+        closed.close()
+        bodies: list[tuple[BodyProducer, type[Exception]]] = [
+            (closed, ValueError),
+            (AsyncIterableBody(failing()), ConnectionResetError),
+        ]
+        for body, error in bodies:
+            with self.subTest(body=type(body).__name__):
+                self.path.write_bytes(b"precious")
+                with _recorded_thread_hops() as hops, self.assertRaises(error):
+                    await asave_body(body, self.path)
+                self.assertEqual(hops, [])
+                self.assertEqual(self.path.read_bytes(), b"precious")
+
+    async def test_empty_body_still_replaces_the_file(self) -> None:
+        """
+        Test that a body which is readable but empty truncates (or
+        creates) the file like any other.
+        """
+        for body in (b"", IterableBody([])):
+            with self.subTest(body=type(body).__name__):
+                self.path.write_bytes(b"old contents")
+                self.assertEqual(await asave_body(body, self.path), 0)
+                self.assertEqual(self.path.read_bytes(), b"")
+
+    async def test_short_writes_are_completed(self) -> None:
+        """
+        Test that a target taking only a part of the data per write gets
+        all of it, across the batches.
+        """
+        target = _RawTarget(accepts=3)
+        written = await asave_body(IterableBody([b"abcdefgh", b"ij"]), cast("IO[bytes]", target))
+        self.assertEqual(written, 10)
+        self.assertEqual(target.data, b"abcdefghij")
