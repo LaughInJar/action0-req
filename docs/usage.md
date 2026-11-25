@@ -299,6 +299,92 @@ print(asyncio.run(main()))
 # [b'async', b'chunks']
 ```
 
+### Releasing a streamed body
+
+A body streaming from a resource — an open connection, say — takes a
+callback that releases it: `close=` for `IterableBody`, an awaitable
+`aclose=` for `AsyncIterableBody`. The callback runs exactly once: when
+the body has been read to its end, when a consumer gives up midway, or
+when the body is closed explicitly. The last case also covers a body
+that is never read at all, where a generator's own `finally` block
+would not run:
+
+```python
+from action0.req import IterableBody
+
+
+def generate():
+    yield b"chunk1"
+    yield b"chunk2"
+
+
+body = IterableBody(generate(), close=lambda: print("connection released"))
+with body:
+    pass  # decided not to read it
+# connection released
+body.close()  # no effect: the callback has run
+```
+
+### Spooled bodies
+
+{py:class}`~action0.req.body.SpooledBody` is the producer for a body
+that is stored first and read afterwards: it is written to while the
+data arrives, so the connection is free again before anyone looks at
+the data. Up to `max_memory` bytes (1 MiB by default) are kept in
+memory; the write exceeding that moves everything to an anonymous
+temporary file, so memory use stays bounded however large the body is.
+It can be read any number of times, and
+{py:meth}`~action0.req.body.SpooledBody.file` offers it as a seekable
+binary file object:
+
+```python
+from action0.req import SpooledBody
+
+with SpooledBody(max_memory=8) as body:
+    body.write(b"chunk1")
+    print(body.rolled)
+    # False
+    body.write(b"chunk2")  # exceeds max_memory: moved to a temporary file
+    print(body.rolled, body.content_length())
+    # True 12
+    print(list(body.chunks()) == list(body.chunks()))  # re-readable
+    # True
+    file = body.file()  # seekable, rewound by every call
+    file.seek(5)
+    print(file.read())
+    # b'1chunk2'
+print(body.closed)  # leaving the block removed the temporary file
+# True
+```
+
+The temporary file is removed by `close()`, by leaving the `with` block
+or by closing the file object (it is the body's own file, not a copy) —
+garbage collection is only the last resort.
+
+In asynchronous code use `awrite()`, `achunks()` and `aclose()` (or
+`async with`). While the data is in memory they run inline; once it is
+in the temporary file every file operation runs in a worker thread
+(`asyncio.to_thread`, or trio's thread pool when running below trio), so
+the event loop is never blocked. That is one thread hop per `awrite()`
+call — write chunks of tens of kilobytes rather than single bytes:
+
+```python
+import asyncio
+
+from action0.req import SpooledBody
+
+
+async def main():
+    async with SpooledBody(max_memory=0) as body:  # 0: on disk from the first byte
+        await body.awrite(b"chunk1")
+        await body.awrite(b"chunk2")
+        return [chunk async for chunk in body.achunks()]
+
+
+print(asyncio.run(main()))
+# [b'chunk1chunk2']
+```
+
 ## Responses
 
 {py:class}`~action0.req.response.Response` mirrors `Request` for the
@@ -350,3 +436,130 @@ print(resp.request)
 print(resp == Response(200))
 # True
 ```
+
+### Response bodies as files
+
+{py:meth}`~action0.req.response.Response.body_file` returns the body as
+a seekable binary file object — for consumers that read from a file,
+like streaming parsers or decompressors. For an in-memory body that is
+an in-memory file; a {py:class}`~action0.req.body.SpooledBody` hands out
+its own file; and a streamed body is read to its end into a new
+`SpooledBody`, which then replaces `resp.body`, so the response stays
+readable:
+
+```python
+import gzip
+import json
+
+from action0.req import IterableBody, Response
+
+compressed = gzip.compress(json.dumps({"rows": [1, 2, 3]}).encode())
+resp = Response(200, body=IterableBody([compressed[:10], compressed[10:]]))  # a streamed body
+
+with resp:  # closing the response discards the spooled data
+    with gzip.GzipFile(fileobj=resp.body_file()) as report:
+        print(json.load(report))
+        # {'rows': [1, 2, 3]}
+    print(type(resp.body).__name__)
+    # SpooledBody
+```
+
+### Saving a response body
+
+{py:meth}`~action0.req.response.Response.save_body` copies the body into
+a path or an open binary file object, chunk by chunk — a streamed body
+never has to fit in memory. A path is created or truncated, or appended
+to with `append=True`; a file object is written at its current position
+and left open. The return value is the number of bytes written.
+
+Because the response is in your hands before anything is written, you
+decide whether its body belongs in the file. Resuming a download with an
+HTTP `Range` request, for example, appends only if the server really
+answered with the requested part — an error page never ends up in the
+file:
+
+```python
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from action0.req import IterableBody, Response
+
+with TemporaryDirectory() as tmp:
+    path = Path(tmp) / "feed.json"
+    path.write_bytes(b'{"items": [1, 2')  # an earlier download that broke off
+    offset = path.stat().st_size
+
+    # the answer to a request sent with "Range: bytes=15-"
+    resp = Response(
+        206,
+        headers={"Content-Range": f"bytes {offset}-19/20"},
+        body=IterableBody([b", 3", b"]}"]),
+    )
+    with resp:
+        if resp.status == 206 and resp.headers["Content-Range"].startswith(f"bytes {offset}-"):
+            print(resp.save_body(path, append=True))
+            # 5
+    print(path.read_bytes())
+    # b'{"items": [1, 2, 3]}'
+```
+
+If the body breaks off midway, the exception passes through and what
+has arrived is in the file — its size is the offset to resume from.
+
+{py:meth}`~action0.req.response.Response.asave_body` is the asynchronous
+twin: it reads the body via `achunks()` and does every file operation in
+a worker thread, writing small chunks 64 KiB at a time. Both exist as
+functions too ({py:func}`~action0.req.body.save_body`,
+{py:func}`~action0.req.body.asave_body`), for a body that is not part of
+a response.
+
+### Closing a response
+
+A response whose body holds a resource should be closed: a streamed
+body that was not read to its end still occupies its connection, a
+spooled body its temporary file. Use the response as a context manager
+(`with` or `async with`), or call
+{py:meth}`~action0.req.response.Response.close` /
+{py:meth}`~action0.req.response.Response.aclose`. For a body that holds
+nothing (bytes, str, none) both do nothing, so closing every response
+is always safe:
+
+```python
+from action0.req import IterableBody, Response
+
+body = IterableBody(iter([b"never", b"read"]), close=lambda: print("connection released"))
+with Response(200, body=body) as resp:
+    print(resp.status)
+    # 200
+# connection released
+
+with Response(200, body=b"plain") as resp:  # nothing to release
+    print(resp.body_bytes())
+    # b'plain'
+```
+
+`copy()` shares the body, so closing one copy closes it for all of
+them. A body that can only be closed asynchronously (an
+`AsyncIterableBody` with an `aclose` callback) makes `close()` raise a
+`RuntimeError` instead of silently leaving the resource open.
+
+### Pickling
+
+A response with an in-memory body (bytes or str) can be pickled, with
+its headers, `meta` and request reference — which is what storing
+responses outside the process (a cache server, a queue) needs:
+
+```python
+import pickle
+
+from action0.req import Response
+
+resp = Response(200, headers={"Content-Type": "application/json"}, body=b'{"a": 1}')
+restored = pickle.loads(pickle.dumps(resp))
+print(restored == resp, restored.body_bytes())
+# True b'{"a": 1}'
+```
+
+The request reference is pickled along. Drop it first
+(`resp.copy(request=None)`) if the request carries credentials that
+should not end up in the store.
