@@ -1,16 +1,24 @@
 """The HTTP response representation (:py:class:`Response`)."""
 
+import io
+import os
+from types import TracebackType
+from typing import IO
 from typing import Any
 from typing import Mapping
 from typing import Union
 
 from .body import BodyProducer
 from .body import BodyTypes
+from .body import BytesBody
+from .body import SpooledBody
 from .body import _body_bytes
 from .body import _body_producer
 from .body import _body_str
 from .body import _charset
 from .body import _rendered_body
+from .body import asave_body
+from .body import save_body
 from .headers import Headers
 from .headers import HeaderTypes
 from .request import Request
@@ -43,7 +51,19 @@ class Response:
     The body works exactly like the request body: set as ``bytes``,
     ``str`` or a streaming :py:class:`~action0.req.body.BodyProducer`,
     retrieved in any of the three forms via :py:meth:`body_bytes`,
-    :py:meth:`body_str` and :py:meth:`body_producer`.
+    :py:meth:`body_str` and :py:meth:`body_producer`. On top of that a
+    response body can be read as a file (:py:meth:`body_file`) and copied
+    into one (:py:meth:`save_body`, :py:meth:`asave_body`).
+
+    A response whose body holds a resource — a streamed body its
+    connection, a spooled body its temporary file — is released with
+    :py:meth:`close` or :py:meth:`aclose`, or by using the response as a
+    (sync or async) context manager. Both are harmless no-ops for a plain
+    bytes or str body::
+
+        >>> with Response(200, body=b"data") as resp:
+        ...     resp.body_bytes()
+        b'data'
     """
 
     def __init__(
@@ -159,6 +179,185 @@ class Response:
         :return: the body producer, ``None`` if there is no body
         """
         return _body_producer(self.body, _charset(self.headers))
+
+    def body_file(self) -> Union[IO[bytes], None]:
+        """
+        The body as a seekable binary file object positioned at the
+        start — for consumers that read from a file, like streaming
+        parsers or ``gzip.GzipFile(fileobj=...)``::
+
+            >>> import gzip
+            >>> resp = Response(200, body=gzip.compress(b"report"))
+            >>> gzip.GzipFile(fileobj=resp.body_file()).read()
+            b'report'
+
+        What the file is depends on the body:
+
+        - bytes, str and :py:class:`~action0.req.body.BytesBody`: a new,
+          independent in-memory file per call.
+        - :py:class:`~action0.req.body.SpooledBody`: the body's own file,
+          rewound (see :py:meth:`SpooledBody.file()
+          <action0.req.body.SpooledBody.file>`). Closing it discards the
+          data.
+        - any other producer (e.g. a streamed body): the stream is read
+          to its end into a new ``SpooledBody``, which then **replaces**
+          :py:attr:`body` — so the response stays readable, and
+          :py:meth:`close` removes the temporary file. This reads
+          synchronously; in asynchronous code ask for a spooled body
+          upfront instead.
+
+        :return: the file object, ``None`` if there is no body
+        """
+        body = self.body
+        if body is None:
+            return None
+        if isinstance(body, SpooledBody):
+            return body.file()
+        if isinstance(body, (bytes, str, BytesBody)):
+            return io.BytesIO(_body_bytes(body, _charset(self.headers)) or b"")
+        spool = SpooledBody()
+        try:
+            for chunk in body.chunks():
+                spool.write(chunk)
+        except BaseException:
+            # nothing refers to the half-filled spool: don't leave its
+            # temporary file to the garbage collector
+            spool.close()
+            raise
+        self.body = spool
+        return spool.file()
+
+    def save_body(
+        self,
+        target: Union[str, "os.PathLike[str]", IO[bytes]],
+        *,
+        append: bool = False,
+    ) -> int:
+        """
+        Copy the body into a file, chunk by chunk — a streamed body is
+        never held in memory as a whole. See
+        :py:func:`~action0.req.body.save_body` for the details.
+
+        Example — check the response first, write afterwards, so that an
+        error body never ends up in the file::
+
+            >>> import io
+            >>> download = io.BytesIO(b"first half, ")
+            >>> _ = download.seek(0, io.SEEK_END)
+            >>> resp = Response(206, headers={"Content-Range": "bytes 12-22/23"}, body=b"second half")
+            >>> if resp.status == 206:
+            ...     resp.save_body(download)
+            11
+            >>> download.getvalue()
+            b'first half, second half'
+
+        :param target: a path (created or truncated, or appended to with
+                       ``append=True``) or a binary file object (written
+                       at its current position and left open)
+        :param append: for a path: write behind the existing contents
+        :return: the number of bytes written; ``0`` if there is no body
+        """
+        return save_body(self._body_for_saving(), target, append=append)
+
+    async def asave_body(
+        self,
+        target: Union[str, "os.PathLike[str]", IO[bytes]],
+        *,
+        append: bool = False,
+    ) -> int:
+        """
+        :py:meth:`save_body` for asynchronous code: the body is read via
+        ``achunks()`` and all file operations run in a worker thread. See
+        :py:func:`~action0.req.body.asave_body`.
+
+        :param target: a path or a binary file object, as for
+                       :py:meth:`save_body`
+        :param append: for a path: write behind the existing contents
+        :return: the number of bytes written; ``0`` if there is no body
+        """
+        return await asave_body(self._body_for_saving(), target, append=append)
+
+    def _body_for_saving(self) -> Union[bytes, BodyProducer]:
+        """
+        :return: the body in a form the save helpers take: a producer
+                 as-is (to be streamed), everything else as bytes
+        """
+        body = self.body
+        if body is None or isinstance(body, (bytes, str)):
+            return _body_bytes(body, _charset(self.headers)) or b""
+        return body
+
+    def close(self) -> None:
+        """
+        Release what the body holds: the connection of a streamed body
+        that was not read to its end, the temporary file of a spooled
+        body. Safe to call any number of times, and a no-op for bodies
+        that hold nothing (bytes, str, no body).
+
+        A closed body can no longer be read. Note that :py:meth:`copy`
+        shares the body: closing one copy closes it for all of them.
+
+        :raises RuntimeError: if the body can only be closed
+                              asynchronously — use :py:meth:`aclose`
+        """
+        body = self.body
+        close = getattr(body, "close", None)
+        if callable(close):
+            close()
+        elif callable(getattr(body, "aclose", None)):
+            raise RuntimeError("an async body cannot be closed synchronously; use aclose()")
+
+    async def aclose(self) -> None:
+        """
+        :py:meth:`close` for asynchronous code: awaits the body's
+        ``aclose()`` if it has one, and falls back to its ``close()``.
+        """
+        body = self.body
+        # a duck-typed, optional method. Not tested with callable(): that
+        # narrows it to "returns object", which cannot be awaited
+        aclose: Any = getattr(body, "aclose", None)
+        if aclose is not None:
+            await aclose()
+            return
+        close = getattr(body, "close", None)
+        if callable(close):
+            close()
+
+    def __enter__(self) -> "Response":
+        """
+        :return: the response itself; leaving the ``with`` block closes
+                 it, see :py:meth:`close`
+        """
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Union[type[BaseException], None],
+        exc_value: Union[BaseException, None],
+        traceback: Union[TracebackType, None],
+    ) -> None:
+        """
+        Close the response, see :py:meth:`close`.
+        """
+        self.close()
+
+    async def __aenter__(self) -> "Response":
+        """
+        :return: the response itself; leaving the ``async with`` block
+                 closes it, see :py:meth:`aclose`
+        """
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: Union[type[BaseException], None],
+        exc_value: Union[BaseException, None],
+        traceback: Union[TracebackType, None],
+    ) -> None:
+        """
+        Close the response, see :py:meth:`aclose`.
+        """
+        await self.aclose()
 
     def copy(self, **overrides: Any) -> "Response":
         """

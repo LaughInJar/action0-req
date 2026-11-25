@@ -31,6 +31,10 @@ uv add action0-req    # not on PyPI yet — install from GitHub for now
   {py:class}`~action0.req.body.BodyProducer` protocol — sync and async
   (without blocking the event loop), with in-memory, file-backed and
   (async-)iterable-backed producers.
+- Response bodies as files: spooled to a temporary file while they
+  arrive ({py:class}`~action0.req.body.SpooledBody`), read through a
+  seekable file object, saved to a path — and released
+  deterministically with `close()` or a `with` block.
 - Fully typed (checked with mypy strict, pyright and ty), Python 3.11+,
   no runtime dependencies beyond `action0-url`.
 
@@ -42,4 +46,5 @@ personal projects.
 
 usage
 api
+changelog
 ```

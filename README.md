@@ -16,7 +16,8 @@ Full documentation including the API reference:
 **Status:** the core API is complete — the header name, status code and
 method constants, the `Headers` mapping, `Request` and `Response`, and
 sync/async body streaming via `BodyProducer` (`BytesBody`, `FileBody`,
-`IterableBody`, `AsyncIterableBody`).
+`IterableBody`, `AsyncIterableBody`, `SpooledBody`). Changes per release
+are listed in the [changelog](CHANGELOG.md).
 
 
 ## Installation
@@ -92,6 +93,23 @@ print(resp.phrase, resp.is_client_error)  # Not Found True
 print(resp.as_str(separator="\n"))  # "\r\n" by default
 # HTTP/1.1 404 Not Found
 # Content-Type: text/plain
+```
+
+A response body can also be read as a seekable file object and copied
+into a file, and a response releases what its body holds (a connection,
+a temporary file) when closed:
+
+```python
+import gzip
+
+from action0.req import IterableBody, Response
+
+compressed = gzip.compress(b"a large report")
+with Response(200, body=IterableBody([compressed[:8], compressed[8:]])) as resp:
+    # a streamed body is spooled: in memory up to 1 MiB, in a temporary file beyond
+    print(gzip.GzipFile(fileobj=resp.body_file()).read())  # b'a large report'
+    written = resp.save_body("report.gz")  # a path or an open binary file
+    print(written == len(compressed))  # True
 ```
 
 ## Development

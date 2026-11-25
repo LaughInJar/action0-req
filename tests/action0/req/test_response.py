@@ -1,10 +1,23 @@
+import asyncio
+import gzip
+import io
+import pickle
 import unittest
+from collections.abc import AsyncIterator
+from collections.abc import Iterator
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest import mock
 
+from action0.req import AsyncIterableBody
 from action0.req import BytesBody
 from action0.req import Headers
+from action0.req import IterableBody
 from action0.req import Request
 from action0.req import Response
+from action0.req import SpooledBody
 from action0.req import Status
+from action0.req import response as response_module
 
 
 class ResponseInitTestCase(unittest.TestCase):
@@ -267,3 +280,345 @@ class MetaTestCase(unittest.TestCase):
         Test that meta is metadata, like the docstring promises.
         """
         self.assertEqual(Response(200), Response(200, meta={"my-lib.key": "value"}))
+
+
+class ResponseBodyFileTestCase(unittest.TestCase):
+    """
+    tests for :py:meth:`action0.req.response.Response.body_file`
+    """
+
+    def test_no_body(self) -> None:
+        """
+        Test that a response without a body has no file either.
+        """
+        self.assertIsNone(Response(204).body_file())
+
+    def test_in_memory_bodies(self) -> None:
+        """
+        Test that bytes, str (encoded with the charset) and BytesBody
+        yield a seekable in-memory file — a new one per call.
+        """
+        latin = {"Content-Type": "text/plain; charset=latin-1"}
+        cases = [
+            (Response(200, body=b"data"), b"data"),
+            (Response(200, headers=latin, body="né"), b"n\xe9"),
+            (Response(200, body=BytesBody(b"data")), b"data"),
+        ]
+        for resp, expected in cases:
+            with self.subTest(body=resp.body):
+                file = resp.body_file()
+                assert file is not None
+                self.assertTrue(file.seekable())
+                self.assertEqual(file.read(), expected)
+                self.assertIsNot(resp.body_file(), file)
+                # reading one file to its end does not affect the next
+                other = resp.body_file()
+                assert other is not None
+                self.assertEqual(other.read(), expected)
+
+    def test_spooled_body_hands_out_its_own_file(self) -> None:
+        """
+        Test that a spooled body is not copied: the file is the spool's,
+        rewound by every call.
+        """
+        spool = SpooledBody(max_memory=0)
+        spool.write(b"data")
+        with Response(200, body=spool) as resp:
+            file = resp.body_file()
+            assert file is not None
+            self.assertIs(file, spool.file())
+            self.assertEqual(file.read(), b"data")
+            again = resp.body_file()
+            assert again is not None
+            self.assertEqual(again.read(), b"data")
+
+    def test_streamed_body_is_spooled_and_replaced(self) -> None:
+        """
+        Test that a streamed body is read to its end into a spool that
+        replaces it: the stream is released, the response stays readable,
+        and closing the response discards the spool.
+        """
+        released: list[bool] = []
+        stream = IterableBody(iter([b"chunk1", b"chunk2"]), close=lambda: released.append(True))
+        resp = Response(200, body=stream)
+
+        file = resp.body_file()
+        assert file is not None
+        self.assertEqual(file.read(), b"chunk1chunk2")
+        self.assertEqual(released, [True])
+        self.assertIsInstance(resp.body, SpooledBody)
+        self.assertEqual(resp.body_bytes(), b"chunk1chunk2")
+
+        resp.close()
+        self.assertTrue(file.closed)
+
+    def test_broken_stream_leaves_nothing_behind(self) -> None:
+        """
+        Test that a stream breaking off raises, keeps the body as it was
+        and closes the half-filled spool.
+        """
+
+        def broken() -> Iterator[bytes]:
+            yield b"chunk1"
+            raise ConnectionResetError("gone")
+
+        spools: list[SpooledBody] = []
+
+        class _Recording(SpooledBody):
+            """keeps track of the spools the response creates"""
+
+            def __init__(self) -> None:
+                super().__init__()
+                spools.append(self)
+
+        stream = IterableBody(broken())
+        resp = Response(200, body=stream)
+        with mock.patch.object(response_module, "SpooledBody", _Recording):
+            with self.assertRaises(ConnectionResetError):
+                resp.body_file()
+        self.assertIs(resp.body, stream)
+        self.assertEqual(len(spools), 1)
+        self.assertTrue(spools[0].closed)
+
+    def test_file_feeds_gzip(self) -> None:
+        """
+        Test the motivating use: a decompressor reading from the file.
+        """
+        resp = Response(200, body=gzip.compress(b"report"))
+        self.assertEqual(gzip.GzipFile(fileobj=resp.body_file()).read(), b"report")
+
+
+class ResponseSaveBodyTestCase(unittest.TestCase):
+    """
+    tests for :py:meth:`action0.req.response.Response.save_body` and
+    :py:meth:`~action0.req.response.Response.asave_body`
+    """
+
+    def setUp(self) -> None:
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "download.bin"
+
+    def test_body_forms(self) -> None:
+        """
+        Test that every body form is saved: none (an empty file), bytes,
+        str (encoded with the charset) and a producer.
+        """
+        latin = {"Content-Type": "text/plain; charset=latin-1"}
+        cases = [
+            (Response(204), b""),
+            (Response(200, body=b"data"), b"data"),
+            (Response(200, headers=latin, body="né"), b"n\xe9"),
+            (Response(200, body=IterableBody([b"da", b"ta"])), b"data"),
+        ]
+        for resp, expected in cases:
+            with self.subTest(body=resp.body):
+                self.assertEqual(resp.save_body(self.path), len(expected))
+                self.assertEqual(self.path.read_bytes(), expected)
+
+    def test_resumed_download(self) -> None:
+        """
+        Test the resume flow: the partial file is continued with
+        ``append=True`` once status and Content-Range have been checked —
+        an error response writes nothing.
+        """
+        self.path.write_bytes(b"first half, ")
+        offset = self.path.stat().st_size
+
+        error = Response(416, body=b"<html>range not satisfiable</html>")
+        partial = Response(
+            206,
+            headers={"Content-Range": f"bytes {offset}-22/23"},
+            body=IterableBody(iter([b"second", b" half"])),
+        )
+        for resp in (error, partial):
+            content_range = resp.headers.get("Content-Range", "")
+            if resp.status == 206 and content_range.startswith(f"bytes {offset}-"):
+                resp.save_body(self.path, append=True)
+
+        self.assertEqual(self.path.read_bytes(), b"first half, second half")
+
+    def test_to_file_object(self) -> None:
+        """
+        Test that a file object is written at its position and left open.
+        """
+        buffer = io.BytesIO()
+        self.assertEqual(Response(200, body="data").save_body(buffer), 4)
+        self.assertFalse(buffer.closed)
+        self.assertEqual(buffer.getvalue(), b"data")
+
+    def test_async(self) -> None:
+        """
+        Test the asynchronous twin with a sync-less async stream, a plain
+        body and no body.
+        """
+
+        async def source() -> AsyncIterator[bytes]:
+            yield b"da"
+            yield b"ta"
+
+        async def main() -> list[int]:
+            written = [await Response(204).asave_body(self.path)]
+            written.append(await Response(200, body="data").asave_body(self.path))
+            streamed = Response(200, body=AsyncIterableBody(source()))
+            written.append(await streamed.asave_body(self.path, append=True))
+            return written
+
+        self.assertEqual(asyncio.run(main()), [0, 4, 4])
+        self.assertEqual(self.path.read_bytes(), b"datadata")
+
+
+class ResponseCloseTestCase(unittest.TestCase):
+    """
+    tests for :py:meth:`action0.req.response.Response.close`,
+    :py:meth:`~action0.req.response.Response.aclose` and the context
+    manager forms
+    """
+
+    def test_close_is_a_noop_for_plain_bodies(self) -> None:
+        """
+        Test that responses holding nothing can be closed, repeatedly,
+        and stay readable.
+        """
+        for resp in (Response(204), Response(200, body=b"data"), Response(200, body="data")):
+            with self.subTest(body=resp.body):
+                resp.close()
+                resp.close()
+                asyncio.run(resp.aclose())
+                self.assertEqual(resp.body, resp.copy().body)
+
+    def test_close_releases_a_streamed_body(self) -> None:
+        """
+        Test that closing a response whose streamed body was never read
+        releases the stream — once.
+        """
+        released: list[bool] = []
+        body = IterableBody(iter([b"data"]), close=lambda: released.append(True))
+        resp = Response(200, body=body)
+        resp.close()
+        resp.close()
+        self.assertEqual(released, [True])
+
+    def test_close_discards_a_spooled_body(self) -> None:
+        """
+        Test that closing the response closes its spool.
+        """
+        spool = SpooledBody(max_memory=0)
+        spool.write(b"data")
+        Response(200, body=spool).close()
+        self.assertTrue(spool.closed)
+
+    def test_copies_share_the_body(self) -> None:
+        """
+        Test the documented consequence of copy() sharing the body:
+        closing one copy closes it for all.
+        """
+        spool = SpooledBody()
+        resp = Response(200, body=spool)
+        resp.copy(status=201).close()
+        self.assertTrue(spool.closed)
+        resp.close()
+
+    def test_close_refuses_an_async_only_body(self) -> None:
+        """
+        Test that close() does not silently skip a body that can only be
+        closed asynchronously.
+        """
+
+        async def source() -> AsyncIterator[bytes]:
+            yield b"data"
+
+        resp = Response(200, body=AsyncIterableBody(source()))
+        with self.assertRaises(RuntimeError):
+            resp.close()
+
+    def test_context_manager(self) -> None:
+        """
+        Test that ``with response:`` closes on the way out, also when the
+        block raises.
+        """
+        released: list[bool] = []
+
+        def streamed() -> Response:
+            body = IterableBody(iter([b"data"]), close=lambda: released.append(True))
+            return Response(200, body=body)
+
+        with streamed() as resp:
+            self.assertEqual(resp.status, 200)
+        self.assertEqual(released, [True])
+
+        with self.assertRaises(KeyError):
+            with streamed():
+                raise KeyError("boom")
+        self.assertEqual(released, [True, True])
+
+    def test_aclose_and_async_context_manager(self) -> None:
+        """
+        Test that aclose() awaits an async body's own aclose(), falls
+        back to close() for a synchronous one, and that ``async with``
+        uses it.
+        """
+        released: list[str] = []
+
+        async def source() -> AsyncIterator[bytes]:
+            yield b"data"
+
+        async def release() -> None:
+            released.append("async")
+
+        async def main() -> None:
+            await Response(200, body=AsyncIterableBody(source(), aclose=release)).aclose()
+
+            sync_body = IterableBody(iter([b"data"]), close=lambda: released.append("sync"))
+            await Response(200, body=sync_body).aclose()
+
+            spool = SpooledBody(max_memory=0)
+            await spool.awrite(b"data")
+            async with Response(200, body=spool) as resp:
+                self.assertIs(resp.body, spool)
+            self.assertTrue(spool.closed)
+
+        asyncio.run(main())
+        self.assertEqual(released, ["async", "sync"])
+
+
+class ResponsePickleTestCase(unittest.TestCase):
+    """
+    tests for pickling a :py:class:`action0.req.response.Response` — what
+    out-of-process stores (caches, queues) rely on
+    """
+
+    def test_round_trip(self) -> None:
+        """
+        Test that a response with an in-memory body survives pickling
+        with every part intact: status, reason, multi-value headers,
+        body, HTTP version, meta and the request reference.
+        """
+        request = Request("https://api.example.com/items?page=2", headers={"Accept": "*/*"})
+        resp = Response(
+            203,
+            headers=[("Set-Cookie", "a=1"), ("set-cookie", "b=2"), ("Content-Type", "text/plain")],
+            body=b"\x00binary\xff",
+            reason="Sort Of",
+            http_version="HTTP/2",
+            request=request,
+            meta={"my-lib.cached": True},
+        )
+        for protocol in range(2, pickle.HIGHEST_PROTOCOL + 1):
+            with self.subTest(protocol=protocol):
+                restored = pickle.loads(pickle.dumps(resp, protocol))
+                self.assertEqual(restored, resp)
+                self.assertEqual(restored.headers.as_lines(), resp.headers.as_lines())
+                self.assertEqual(restored.meta, {"my-lib.cached": True})
+                self.assertEqual(restored.request, request)
+                self.assertEqual(restored.phrase, "Sort Of")
+
+    def test_round_trip_without_request(self) -> None:
+        """
+        Test the form a cache would store: no request reference, a str
+        body.
+        """
+        resp = Response(200, headers={"Content-Type": "application/json"}, body='{"a": 1}')
+        restored = pickle.loads(pickle.dumps(resp))
+        self.assertEqual(restored, resp)
+        self.assertIsNone(restored.request)

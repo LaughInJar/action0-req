@@ -3,6 +3,9 @@ from .body import BodyProducer
 from .body import BytesBody
 from .body import FileBody
 from .body import IterableBody
+from .body import SpooledBody
+from .body import asave_body
+from .body import save_body
 from .headers import Header
 from .headers import Headers
 from .request import Method
@@ -23,5 +26,8 @@ __all__ = [
     "Method",
     "Request",
     "Response",
+    "SpooledBody",
     "Status",
+    "asave_body",
+    "save_body",
 ]
