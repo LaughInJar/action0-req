@@ -17,7 +17,7 @@ Full documentation including the API reference:
 method constants, the `Headers` mapping, `Request` and `Response`, and
 sync/async body streaming via `BodyProducer` (`BytesBody`, `FileBody`,
 `IterableBody`, `AsyncIterableBody`, `SpooledBody`). Changes per release
-are listed in the [changelog](CHANGELOG.md).
+are listed in the [changelog](https://laughinjar.github.io/action0-req/changelog.html).
 
 
 ## Installation

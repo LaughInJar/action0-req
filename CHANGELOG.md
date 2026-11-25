@@ -15,10 +15,13 @@ numbers follow [Semantic Versioning](https://semver.org/).
   deterministically by `close()` or a `with` block. `awrite()`,
   `achunks()` and `aclose()` do their file I/O in a worker thread.
 - `Response.body_file()`: the response body as a seekable binary file
-  object, whatever form the body has. A streamed body is spooled.
+  object, whatever form the body has. A streamed body is spooled, and
+  the stream closed; a `FileBody` hands out its file without a copy.
 - `Response.save_body()` and `Response.asave_body()`, plus the functions
   `save_body()` and `asave_body()`: copy a body into a path or an open
   file object chunk by chunk, with `append=True` for resumed downloads.
+  A path is opened only once the body has delivered its first chunk, so
+  a body that cannot be read leaves an existing file untouched.
 - `Response.close()` and `Response.aclose()`; a response is now a sync
   and async context manager. They release what the body holds and do
   nothing for in-memory bodies.
@@ -26,9 +29,18 @@ numbers follow [Semantic Versioning](https://semver.org/).
   a callback releasing the resource behind the stream. It runs exactly
   once: after the body has been consumed, when a consumer stops early,
   or on `close()` / `aclose()`. Both classes are context managers.
+  `AsyncIterableBody.close()` is the synchronous counterpart for a body
+  with nothing left to release; it raises while the callback is pending.
 - trio support for asynchronous file I/O: `FileBody.achunks()` and the
   new asynchronous file operations use trio's thread pool when running
   below trio. Before, `FileBody.achunks()` worked on asyncio only.
+  Cleanup — closing a file, writing out what has arrived — also runs
+  when the task has been cancelled.
+
+### Fixed
+
+- `FileBody.achunks()` closes the file it opened also when the consuming
+  task is cancelled repeatedly, as anyio does on a timeout.
 
 ## 0.1.1 — 2026-08-08
 

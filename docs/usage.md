@@ -359,14 +359,18 @@ print(body.closed)  # leaving the block removed the temporary file
 
 The temporary file is removed by `close()`, by leaving the `with` block
 or by closing the file object (it is the body's own file, not a copy) —
-garbage collection is only the last resort.
+garbage collection is only the last resort. Because the file object is
+shared, reading it moves its position; `write()` appends at the end
+wherever a reader has left it.
 
 In asynchronous code use `awrite()`, `achunks()` and `aclose()` (or
 `async with`). While the data is in memory they run inline; once it is
 in the temporary file every file operation runs in a worker thread
 (`asyncio.to_thread`, or trio's thread pool when running below trio), so
 the event loop is never blocked. That is one thread hop per `awrite()`
-call — write chunks of tens of kilobytes rather than single bytes:
+call — write chunks of tens of kilobytes rather than single bytes.
+`aclose()` removes the temporary file also when the task has been
+cancelled, e.g. by a timeout:
 
 ```python
 import asyncio
@@ -443,9 +447,13 @@ print(resp == Response(200))
 a seekable binary file object — for consumers that read from a file,
 like streaming parsers or decompressors. For an in-memory body that is
 an in-memory file; a {py:class}`~action0.req.body.SpooledBody` hands out
-its own file; and a streamed body is read to its end into a new
+its own file; a {py:class}`~action0.req.body.FileBody` hands out the
+file it wraps, or opens its path once — nothing is copied, and the
+opened file is closed with the response; and a streamed body is read to
+its end into a new
 `SpooledBody`, which then replaces `resp.body`, so the response stays
-readable:
+readable. The stream it replaces has delivered everything and is closed,
+which releases its connection:
 
 ```python
 import gzip
@@ -504,11 +512,16 @@ with TemporaryDirectory() as tmp:
 ```
 
 If the body breaks off midway, the exception passes through and what
-has arrived is in the file — its size is the offset to resume from.
+has arrived is in the file — its size is the offset to resume from. A
+path is opened only once the body has delivered its first chunk: a body
+that cannot be read at all (already closed, failing right away) raises
+without creating or truncating the file.
 
 {py:meth}`~action0.req.response.Response.asave_body` is the asynchronous
 twin: it reads the body via `achunks()` and does every file operation in
-a worker thread, writing small chunks 64 KiB at a time. Both exist as
+a worker thread, writing small chunks 64 KiB at a time. When the task is
+cancelled midway (a timeout), what has arrived is still written and the
+file closed before the cancellation is passed on. Both exist as
 functions too ({py:func}`~action0.req.body.save_body`,
 {py:func}`~action0.req.body.asave_body`), for a body that is not part of
 a response.
@@ -541,7 +554,9 @@ with Response(200, body=b"plain") as resp:  # nothing to release
 `copy()` shares the body, so closing one copy closes it for all of
 them. A body that can only be closed asynchronously (an
 `AsyncIterableBody` with an `aclose` callback) makes `close()` raise a
-`RuntimeError` instead of silently leaving the resource open.
+`RuntimeError` instead of silently leaving the resource open. A `with`
+block left by an exception passes that exception on instead: the error
+that happened first is the one to see.
 
 ### Pickling
 

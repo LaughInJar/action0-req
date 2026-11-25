@@ -11,11 +11,14 @@ from typing import Union
 from .body import BodyProducer
 from .body import BodyTypes
 from .body import BytesBody
+from .body import FileBody
 from .body import SpooledBody
 from .body import _body_bytes
 from .body import _body_producer
 from .body import _body_str
 from .body import _charset
+from .body import _closes_async_only
+from .body import _file_of
 from .body import _rendered_body
 from .body import asave_body
 from .body import save_body
@@ -199,10 +202,19 @@ class Response:
           rewound (see :py:meth:`SpooledBody.file()
           <action0.req.body.SpooledBody.file>`). Closing it discards the
           data.
+        - :py:class:`~action0.req.body.FileBody` over a seekable file
+          object: that file object, rewound. It stays yours — neither
+          the body nor :py:meth:`close` closes it.
+        - ``FileBody`` over a path: the file is opened, and a
+          ``FileBody`` owning the open file **replaces**
+          :py:attr:`body`. Further calls return the same file, rewound,
+          and :py:meth:`close` closes it. Nothing is copied.
         - any other producer (e.g. a streamed body): the stream is read
           to its end into a new ``SpooledBody``, which then **replaces**
           :py:attr:`body` — so the response stays readable, and
-          :py:meth:`close` removes the temporary file. This reads
+          :py:meth:`close` removes the temporary file. The producer it
+          replaces has delivered everything and is closed (if it has a
+          ``close()``), which releases its connection. This reads
           synchronously; in asynchronous code ask for a spooled body
           upfront instead.
 
@@ -215,6 +227,13 @@ class Response:
             return body.file()
         if isinstance(body, (bytes, str, BytesBody)):
             return io.BytesIO(_body_bytes(body, _charset(self.headers)) or b"")
+        if isinstance(body, FileBody):
+            found = _file_of(body)
+            if found is not None:
+                # for a path: the body now holding the open file, so that
+                # close() releases it like everything else
+                self.body, file = found
+                return file
         spool = SpooledBody()
         try:
             for chunk in body.chunks():
@@ -225,6 +244,11 @@ class Response:
             spool.close()
             raise
         self.body = spool
+        # the response no longer refers to the producer, so close() could
+        # not reach it later: release what it holds now
+        close = getattr(body, "close", None)
+        if callable(close):
+            close()
         return spool.file()
 
     def save_body(
@@ -297,15 +321,18 @@ class Response:
         A closed body can no longer be read. Note that :py:meth:`copy`
         shares the body: closing one copy closes it for all of them.
 
-        :raises RuntimeError: if the body can only be closed
-                              asynchronously — use :py:meth:`aclose`
+        :raises RuntimeError: if the body holds something that can only
+                              be released asynchronously (an ``aclose``
+                              callback still to run, a producer with
+                              ``aclose()`` but no ``close()``) — use
+                              :py:meth:`aclose`
         """
         body = self.body
+        if _closes_async_only(body):
+            raise RuntimeError("an async body cannot be closed synchronously; use aclose()")
         close = getattr(body, "close", None)
         if callable(close):
             close()
-        elif callable(getattr(body, "aclose", None)):
-            raise RuntimeError("an async body cannot be closed synchronously; use aclose()")
 
     async def aclose(self) -> None:
         """
@@ -338,7 +365,13 @@ class Response:
     ) -> None:
         """
         Close the response, see :py:meth:`close`.
+
+        A body that can only be closed asynchronously makes ``close()``
+        raise. Not so when the block is left by an exception: that error
+        is the one to report, and it is not replaced.
         """
+        if exc_type is not None and _closes_async_only(self.body):
+            return
         self.close()
 
     async def __aenter__(self) -> "Response":

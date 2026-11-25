@@ -11,12 +11,14 @@ from unittest import mock
 
 from action0.req import AsyncIterableBody
 from action0.req import BytesBody
+from action0.req import FileBody
 from action0.req import Headers
 from action0.req import IterableBody
 from action0.req import Request
 from action0.req import Response
 from action0.req import SpooledBody
 from action0.req import Status
+from action0.req import body as body_module
 from action0.req import response as response_module
 
 
@@ -352,6 +354,119 @@ class ResponseBodyFileTestCase(unittest.TestCase):
         resp.close()
         self.assertTrue(file.closed)
 
+    def test_file_body_over_a_path_is_opened_not_copied(self) -> None:
+        """
+        Test that the file behind a path-based FileBody is opened once
+        and handed out as it is: no spool, the same file (rewound) on
+        every call, the response still readable, and close() closing the
+        file.
+        """
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "cached.bin"
+            path.write_bytes(b"abcdef")
+            resp = Response(200, body=FileBody(path, chunk_size=4))
+
+            file = resp.body_file()
+            assert file is not None
+            self.assertEqual(file.read(), b"abcdef")
+            self.assertIsInstance(resp.body, FileBody)
+            self.assertEqual(Path(file.name), path)
+
+            self.assertIs(resp.body_file(), file)
+            self.assertEqual(file.tell(), 0)
+            body = resp.body_producer()
+            assert body is not None
+            self.assertEqual(list(body.chunks()), [b"abcd", b"ef"])
+            self.assertEqual(body.content_length(), 6)
+
+            resp.close()
+            self.assertTrue(file.closed)
+            resp.close()
+
+    def test_file_body_over_a_seekable_file_object(self) -> None:
+        """
+        Test that a FileBody wrapping a seekable file object hands out
+        that very object, rewound — and that it stays the caller's:
+        closing the response does not close it.
+        """
+        source = io.BytesIO(b"abcdef")
+        source.seek(3)
+        body = FileBody(source)
+        resp = Response(200, body=body)
+
+        file = resp.body_file()
+        self.assertIs(file, source)
+        self.assertEqual(source.tell(), 0)
+        self.assertIs(resp.body, body)
+
+        resp.close()
+        self.assertFalse(source.closed)
+
+    def test_file_body_that_is_not_seekable_is_spooled(self) -> None:
+        """
+        Test that a FileBody without a seekable file is spooled like any
+        stream: over a non-seekable file object, and over a path that
+        does not open as a seekable file — whose handle is closed again.
+        """
+
+        class _Pipe(io.BytesIO):
+            def seekable(self) -> bool:
+                return False
+
+        resp = Response(200, body=FileBody(_Pipe(b"abcdef")))
+        with resp:
+            file = resp.body_file()
+            assert file is not None
+            self.assertEqual(file.read(), b"abcdef")
+            self.assertIsInstance(resp.body, SpooledBody)
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "cached.bin"
+            path.write_bytes(b"abcdef")
+            pipe = _Pipe()
+            with mock.patch.object(body_module, "_open_binary", return_value=pipe):
+                with Response(200, body=FileBody(path)) as resp:
+                    file = resp.body_file()
+                    assert file is not None
+                    self.assertEqual(file.read(), b"abcdef")
+                    self.assertIsInstance(resp.body, SpooledBody)
+            self.assertTrue(pipe.closed)
+
+    def test_replaced_producer_is_closed(self) -> None:
+        """
+        Test that a producer which does not close itself when read to its
+        end is closed once the spool has replaced it — afterwards the
+        response has no way to reach it anymore.
+        """
+
+        class _Connection:
+            closed = 0
+
+            def content_length(self) -> None:
+                return None
+
+            def chunks(self) -> Iterator[bytes]:
+                yield b"chunk1"
+                yield b"chunk2"
+
+            async def achunks(self) -> AsyncIterator[bytes]:
+                yield b"chunk1chunk2"  # pragma: no cover
+
+            def as_bytes(self) -> bytes:
+                return b"chunk1chunk2"  # pragma: no cover
+
+            def close(self) -> None:
+                self.closed += 1
+
+        connection = _Connection()
+        with Response(200, body=connection) as resp:
+            file = resp.body_file()
+            assert file is not None
+            self.assertEqual(file.read(), b"chunk1chunk2")
+            self.assertIsInstance(resp.body, SpooledBody)
+            self.assertEqual(connection.closed, 1)
+        self.assertEqual(connection.closed, 1)
+
     def test_broken_stream_leaves_nothing_behind(self) -> None:
         """
         Test that a stream breaking off raises, keeps the body as it was
@@ -521,16 +636,75 @@ class ResponseCloseTestCase(unittest.TestCase):
 
     def test_close_refuses_an_async_only_body(self) -> None:
         """
-        Test that close() does not silently skip a body that can only be
-        closed asynchronously.
+        Test that close() does not silently skip a body holding something
+        that can only be released asynchronously: an async body with an
+        ``aclose`` callback, a producer with ``aclose()`` but no
+        ``close()``.
+        """
+        released: list[bool] = []
+
+        async def source() -> AsyncIterator[bytes]:
+            yield b"data"  # pragma: no cover
+
+        async def release() -> None:
+            released.append(True)
+
+        class _AsyncOnly(BytesBody):
+            async def aclose(self) -> None:
+                released.append(True)  # pragma: no cover
+
+        for body in (AsyncIterableBody(source(), aclose=release), _AsyncOnly(b"data")):
+            with self.subTest(body=type(body).__name__):
+                with self.assertRaises(RuntimeError):
+                    Response(200, body=body).close()
+        self.assertEqual(released, [])
+
+    def test_close_of_an_async_body_holding_nothing(self) -> None:
+        """
+        Test that close() is a no-op for an async body with nothing to
+        release: one without an ``aclose`` callback, or with a callback
+        that has run already.
+        """
+        released: list[bool] = []
+
+        async def source() -> AsyncIterator[bytes]:
+            yield b"data"  # pragma: no cover
+
+        async def release() -> None:
+            released.append(True)
+
+        with Response(200, body=AsyncIterableBody(source())) as resp:
+            resp.close()
+
+        resp = Response(200, body=AsyncIterableBody(source(), aclose=release))
+        asyncio.run(resp.aclose())
+        resp.close()
+        self.assertEqual(released, [True])
+
+    def test_context_manager_does_not_replace_the_error(self) -> None:
+        """
+        Test that a ``with`` block left by an exception raises that
+        exception also when the body can only be closed asynchronously —
+        while leaving it normally does report the body that is still
+        open.
         """
 
         async def source() -> AsyncIterator[bytes]:
-            yield b"data"
+            yield b"data"  # pragma: no cover
 
-        resp = Response(200, body=AsyncIterableBody(source()))
+        async def release() -> None:
+            pass  # pragma: no cover
+
+        def streamed() -> Response:
+            return Response(200, body=AsyncIterableBody(source(), aclose=release))
+
+        with self.assertRaises(KeyError):
+            with streamed():
+                raise KeyError("boom")
+
         with self.assertRaises(RuntimeError):
-            resp.close()
+            with streamed():
+                pass
 
     def test_context_manager(self) -> None:
         """
