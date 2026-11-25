@@ -7,10 +7,13 @@ import inspect
 import io
 import itertools
 import os
+import stat
 import sys
 import tempfile
+import threading
 from types import TracebackType
 from typing import IO
+from typing import Any
 from typing import AsyncIterable
 from typing import AsyncIterator
 from typing import Awaitable
@@ -141,12 +144,16 @@ async def _in_thread(function: Callable[_P, _T], *args: _P.args, **kwargs: _P.kw
     When there is no running asyncio loop but trio has been imported, the
     caller must be a trio task, so trio's own thread pool is used.
 
-    A thread cannot be stopped, so a function that has started is never
+    A thread cannot be stopped, so a function that has started is not
     abandoned: if the calling task is cancelled in the meantime, the
     function still runs to its end before the cancellation is passed on.
     Nothing else gets to touch the file it works on while it does. On
     asyncio the result of the function is lost in that case — a function
     whose result must not get lost (an opened file) records it itself.
+
+    That is for calls that are over soon: writes, and whatever happens to
+    the library's own temporary files. A call that may block for as long
+    as somebody else likes goes through :py:func:`_in_thread_abandonable`.
 
     trio does not start the function at all in a scope that is cancelled
     already; :py:func:`_in_thread_shielded` is for what has to run
@@ -158,7 +165,7 @@ async def _in_thread(function: Callable[_P, _T], *args: _P.args, **kwargs: _P.kw
     :return: what the function returned
     :raises RuntimeError: if called outside of asyncio and trio
     """
-    return await _dispatch(functools.partial(function, *args, **kwargs), shield=False)
+    return await _dispatch(functools.partial(function, *args, **kwargs))
 
 
 async def _in_thread_shielded(
@@ -183,15 +190,38 @@ async def _in_thread_shielded(
     return await _dispatch(functools.partial(function, *args, **kwargs), shield=True)
 
 
-async def _dispatch(call: Callable[[], _T], *, shield: bool) -> _T:
+async def _in_thread_abandonable(
+    function: Callable[_P, _T], *args: _P.args, **kwargs: _P.kwargs
+) -> _T:
     """
-    The worker-thread dispatch behind :py:func:`_in_thread` and
-    :py:func:`_in_thread_shielded`.
+    :py:func:`_in_thread` for a call that may block for as long as
+    somebody else likes — reading a file that is really a pipe or a
+    device: a cancellation of the calling task is passed on at once and
+    the thread is left behind, to finish whenever the call returns.
+    Waiting for it would make a stalled read impossible to time out.
+
+    The caller has to cope with the function still running afterwards.
+
+    :param function: the blocking function
+    :param args: its positional arguments
+    :param kwargs: its keyword arguments
+    :return: what the function returned
+    :raises RuntimeError: if called outside of asyncio and trio
+    """
+    return await _dispatch(functools.partial(function, *args, **kwargs), abandon=True)
+
+
+async def _dispatch(call: Callable[[], _T], *, shield: bool = False, abandon: bool = False) -> _T:
+    """
+    The worker-thread dispatch behind :py:func:`_in_thread` and its two
+    variants.
 
     :param call: the blocking function, with its arguments bound
     :param shield: whether to run it in a scope that is cancelled already
                    (makes a difference on trio only: asyncio cannot tell
                    beforehand, and always starts the function)
+    :param abandon: whether a cancellation leaves the thread behind
+                    instead of waiting for it
     :return: what the function returned
     :raises RuntimeError: if called outside of asyncio and trio
     """
@@ -203,12 +233,17 @@ async def _dispatch(call: Callable[[], _T], *, shield: bool) -> _T:
         trio = sys.modules.get("trio")
         if trio is None:
             raise
+        if abandon:
+            # the keyword is called like this since trio 0.23
+            return cast("_T", await trio.to_thread.run_sync(call, abandon_on_cancel=True))
         # trio waits for a thread that has started by itself, and
         # delivers a cancellation at the next checkpoint after it
         if not shield:
             return cast("_T", await trio.to_thread.run_sync(call))
         with trio.CancelScope(shield=True):
             return cast("_T", await trio.to_thread.run_sync(call))
+    if abandon:
+        return await asyncio.to_thread(call)
     future = asyncio.ensure_future(asyncio.to_thread(call))
     cancelled: Union[asyncio.CancelledError, None] = None
     while not future.done():
@@ -242,19 +277,76 @@ def _open_binary(path: Union[str, "os.PathLike[str]"], mode: str = "rb") -> IO[b
     return cast("IO[bytes]", open(path, mode))
 
 
-def _open_into(
-    opened: list[IO[bytes]], path: Union[str, "os.PathLike[str]"], mode: str = "rb"
-) -> None:
+class _OwnedFile:
     """
-    Open a file in a binary mode and record it, for opening in a worker
-    thread: a file object returned from there would get lost if the task
-    waiting for it is cancelled, and nobody could close it.
+    The file :py:meth:`FileBody.achunks` opens for a path, read in worker
+    threads.
 
-    :param opened: the list the file object is appended to
-    :param path: the path of the file to open
-    :param mode: the (binary) mode to open the file in
+    A read may block for as long as the source likes (the path of a pipe
+    or a device, a stalled network file system), so a cancelled consumer
+    does not wait for it — the thread is left behind. This class is how
+    the file gets closed nevertheless: by that thread, once the read it
+    was left alone with returns.
     """
-    opened.append(_open_binary(path, mode))
+
+    def __init__(self, path: Union[str, "os.PathLike[str]"]) -> None:
+        """
+        :param path: the path of the file, opened by :py:meth:`open`
+        """
+        self._path = path
+        self._file: Union[IO[bytes], None] = None
+        self._lock = threading.Lock()
+        self._reading = False
+        self._released = False
+
+    def open(self) -> None:
+        """
+        Open the file. The file object is kept here instead of returned:
+        a result handed back from a worker thread gets lost if the task
+        waiting for it is cancelled, and nobody could close the file.
+        """
+        self._file = _open_binary(self._path)
+
+    def read(self, size: int) -> bytes:
+        """
+        :param size: the number of bytes to read at most
+        :return: the bytes read, empty at the end of the file — and when
+                 the consumer has gone already
+        """
+        assert self._file is not None
+        with self._lock:
+            if self._released:
+                return b""
+            self._reading = True
+        try:
+            return self._file.read(size)
+        finally:
+            with self._lock:
+                self._reading = False
+                if self._released:
+                    # left behind by a cancelled consumer: nobody else
+                    # closes the file anymore
+                    self._file.close()
+
+    def release(self) -> bool:
+        """
+        Called when the consumer is done with the file, for whatever
+        reason.
+
+        :return: whether the caller has to :py:meth:`close` the file now.
+                 Not if it was never opened, and not while a read is
+                 still under way — that read closes it
+        """
+        with self._lock:
+            self._released = True
+            return self._file is not None and not self._reading
+
+    def close(self) -> None:
+        """
+        Close the file.
+        """
+        assert self._file is not None
+        self._file.close()
 
 
 class FileBody:
@@ -273,8 +365,11 @@ class FileBody:
 
     :py:meth:`achunks` performs every blocking file operation in a worker
     thread (:py:func:`asyncio.to_thread`, or trio's thread pool when
-    running below trio), so the event loop is never stalled — without any
-    extra dependency.
+    running below trio — trio 0.23 or later), so the event loop is never
+    stalled — without any extra dependency. A read that does not return
+    (a pipe nobody writes to) does not stand in the way of a timeout: the
+    cancellation is passed on at once, and the read is left to finish on
+    its own.
     """
 
     def __init__(
@@ -297,6 +392,8 @@ class FileBody:
             self._path = None
             self._file = source
         self._chunk_size = chunk_size
+        # the file opened for Response.body_file(), see _file_view()
+        self._view: Union[IO[bytes], None] = None
 
     def content_length(self) -> Union[int, None]:
         """
@@ -336,22 +433,23 @@ class FileBody:
                  all file operations run in a worker thread
         """
         if self._path is not None:
-            opened: list[IO[bytes]] = []
+            owned = _OwnedFile(self._path)
             try:
-                await _in_thread(_open_into, opened, self._path)
-                while chunk := await _in_thread(opened[0].read, self._chunk_size):
+                await _in_thread(owned.open)
+                while chunk := await _in_thread_abandonable(owned.read, self._chunk_size):
                     yield chunk
             finally:
-                # shielded: the handle is closed also when the consumer
-                # was cancelled
-                if opened:
-                    await _in_thread_shielded(opened[0].close)
+                # shielded: the file is closed also when the consumer was
+                # cancelled — unless a read is still under way in its
+                # thread, which then closes the file itself
+                if owned.release():
+                    await _in_thread_shielded(owned.close)
             return
         file = self._file
         assert file is not None
         if await _in_thread(file.seekable):
             await _in_thread(file.seek, 0)
-        while chunk := await _in_thread(file.read, self._chunk_size):
+        while chunk := await _in_thread_abandonable(file.read, self._chunk_size):
             yield chunk
 
     def as_bytes(self) -> bytes:
@@ -360,76 +458,51 @@ class FileBody:
         """
         return b"".join(self.chunks())
 
-
-class _OpenedFileBody(FileBody):
-    """
-    A path-based :py:class:`FileBody` that also holds an open file: the
-    view of the body that :py:meth:`Response.body_file()
-    <action0.req.response.Response.body_file>` hands out. It is what
-    ``body_file()`` replaces a plain path-based ``FileBody`` with, so
-    that closing the response closes the file.
-
-    The body itself is read through the path as before — a fresh file
-    per iteration, independent of the view. Whoever closes the view
-    therefore does no harm: the body stays readable, and the next
-    ``body_file()`` opens a new view.
-    """
-
-    def __init__(self, path: Union[str, "os.PathLike[str]"], chunk_size: int) -> None:
+    def _file_view(self) -> Union[IO[bytes], None]:
         """
-        :param path: the path of the file
-        :param chunk_size: the number of bytes per chunk
-        """
-        super().__init__(path, chunk_size)
-        self._view: Union[IO[bytes], None] = None
+        The seekable file object behind the body, for
+        :py:meth:`Response.body_file()
+        <action0.req.response.Response.body_file>` — so that nobody has
+        to copy a file in order to get a file.
 
-    def view(self) -> Union[IO[bytes], None]:
+        A seekable file object given to the constructor is that file. For
+        a path a file is opened and kept: every call returns the same
+        one, and a new one after it has been closed — by :py:meth:`close`
+        or by whoever was handed it. Reading the body does not depend on
+        it, a path is opened freshly for every iteration.
+
+        :return: the file, rewound to the start. ``None`` if there is no
+                 seekable file: a non-seekable file object, or a path
+                 that is not a regular file (a pipe is not opened just to
+                 find out — opening it is not without effect on the
+                 writer)
         """
-        :return: the open file, rewound to the start — opened on the
-                 first call and again after it has been closed. ``None``
-                 if the path does not lead to a seekable file
-        """
-        file = self._view
-        if file is None or file.closed:
-            assert self._path is not None
-            file = self._view = _open_binary(self._path)
-        if not file.seekable():
-            # a pipe or the like: not kept open
-            file.close()
-            return None
+        if self._path is None:
+            file = self._file
+            assert file is not None
+            if not file.seekable():
+                return None
+        else:
+            file = self._view
+            if file is None or file.closed:
+                if not stat.S_ISREG(os.stat(self._path).st_mode):
+                    return None
+                file = self._view = _open_binary(self._path)
         file.seek(0)
         return file
 
     def close(self) -> None:
         """
-        Close the view. Safe to call any number of times.
+        Close the file that :py:meth:`Response.body_file()
+        <action0.req.response.Response.body_file>` has opened for a
+        path-based body. That is all this body ever holds: a file object
+        given to the constructor is never closed, and between two
+        iterations of a path no file is open.
+
+        Safe to call any number of times, and the body stays readable.
         """
         if self._view is not None:
             self._view.close()
-
-
-def _file_of(body: FileBody) -> Union[tuple[FileBody, IO[bytes]], None]:
-    """
-    The seekable file object behind a :py:class:`FileBody`, so that
-    nobody has to copy a file in order to get a file.
-
-    :param body: the body to look into
-    :return: the body to go on with and its file, rewound to the start —
-             the given body if it wraps a seekable file object; for a
-             path an :py:class:`_OpenedFileBody` holding the opened file.
-             ``None`` if the file is not seekable
-    """
-    if body._path is not None:
-        if not isinstance(body, _OpenedFileBody):
-            body = _OpenedFileBody(body._path, body._chunk_size)
-        view = body.view()
-        return None if view is None else (body, view)
-    file = body._file
-    assert file is not None
-    if not file.seekable():
-        return None
-    file.seek(0)
-    return body, file
 
 
 class IterableBody:
@@ -528,9 +601,13 @@ class IterableBody:
         try:
             # generators only: closing one that is exhausted or abandoned
             # does what the garbage collector would do later. Any other
-            # iterable with a close() may well be meant to live on
-            if inspect.isgenerator(self._iterable):
-                self._iterable.close()
+            # iterable with a close() may well be meant to live on. And
+            # not one that is running right now (in another thread, or
+            # calling this very method): that would raise, and it ends
+            # by itself once the callback has released what it reads
+            source = self._iterable
+            if inspect.isgenerator(source) and not source.gi_running:
+                source.close()
         finally:
             if close is not None:
                 close()
@@ -583,6 +660,9 @@ class AsyncIterableBody:
         """
         self._aiterable = aiterable
         self._aclose = aclose
+        # whether an async generator behind the body has been started and
+        # not closed yet: it may hold a resource in a ``finally`` block
+        self._open = False
 
     def content_length(self) -> Union[int, None]:
         """
@@ -603,6 +683,7 @@ class AsyncIterableBody:
                  iterable; the body is closed when the iteration ends,
                  for whatever reason
         """
+        self._open = inspect.isasyncgen(self._aiterable)
         try:
             async for chunk in self._aiterable:
                 yield chunk
@@ -620,15 +701,14 @@ class AsyncIterableBody:
         """
         The synchronous counterpart of :py:meth:`aclose`, for code that
         closes bodies without knowing their kind: it does nothing if
-        there is no ``aclose`` callback (left) to run. An asynchronous
-        generator behind the body is not closed by it — that takes
-        :py:meth:`aclose`.
+        there is nothing (left) to release — no ``aclose`` callback to
+        run, and no asynchronous generator that was read in part.
 
-        :raises RuntimeError: if the ``aclose`` callback is still to run:
-                              it can only be awaited — use
-                              :py:meth:`aclose`
+        :raises RuntimeError: if there is: the callback, and a generator
+                              that has been started, can only be closed
+                              by awaiting — use :py:meth:`aclose`
         """
-        if self._aclose is not None:
+        if self._aclose is not None or self._open:
             raise RuntimeError("an async body cannot be closed synchronously; use aclose()")
 
     async def aclose(self) -> None:
@@ -646,10 +726,13 @@ class AsyncIterableBody:
         # run a second time
         aclose, self._aclose = self._aclose, None
         try:
-            # generators only, as in IterableBody.close()
+            # generators only, and not one that is running right now —
+            # another task is waiting in it for the next chunk —, as in
+            # IterableBody.close()
             source: object = self._aiterable
-            if inspect.isasyncgen(source):
+            if inspect.isasyncgen(source) and not source.ag_running:
                 await source.aclose()
+                self._open = False
         finally:
             if aclose is not None:
                 await aclose()
@@ -677,12 +760,8 @@ class _Spool(tempfile.SpooledTemporaryFile[bytes]):
     """
     The file behind a :py:class:`SpooledBody`: a
     :py:class:`tempfile.SpooledTemporaryFile` that tells whether it has
-    been rolled over to a real file.
-
-    The standard library keeps that state private, and it does not only
-    change when the body asks for it: ``fileno()`` and ``truncate(size)``
-    — called by whoever was handed the file — roll over too. They all go
-    through :py:meth:`rollover`, so this is the one place that knows.
+    been rolled over to a real file — the standard library keeps that
+    state private.
     """
 
     #: whether the data has been moved from memory to a temporary file
@@ -701,6 +780,83 @@ class _Spool(tempfile.SpooledTemporaryFile[bytes]):
             raise ValueError("I/O operation on closed file")
         super().rollover()
         self.rolled = True
+
+
+class _SpoolView(io.RawIOBase):
+    """
+    A read-only, seekable view of a :py:class:`SpooledBody` with a
+    position of its own — the raw file behind what
+    :py:meth:`SpooledBody.file` returns.
+
+    It reads through the body instead of being the body's file: closing
+    it closes nothing but the view, and what one view (or one iteration
+    of the body) reads does not move anybody else's position.
+    """
+
+    #: looked at by consumers that are given a file, e.g. ``gzip``
+    mode = "rb"
+
+    def __init__(self, body: "SpooledBody") -> None:
+        """
+        :param body: the body to read from
+        """
+        super().__init__()
+        self._body = body
+        self._position = 0
+
+    def readable(self) -> bool:
+        """
+        :return: always ``True``
+        """
+        return True
+
+    def seekable(self) -> bool:
+        """
+        :return: always ``True``
+        """
+        return True
+
+    def readinto(self, buffer: Any, /) -> int:
+        """
+        :param buffer: the writable buffer to read into
+        :return: the number of bytes read, ``0`` at the end of the body
+        :raises ValueError: if the view or the body is closed
+        """
+        self._checkClosed()
+        target = memoryview(buffer).cast("B")
+        data = self._body._read_at(self._position, len(target))
+        target[: len(data)] = data
+        self._position += len(data)
+        return len(data)
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET, /) -> int:
+        """
+        :param offset: the position, relative to ``whence``
+        :param whence: ``io.SEEK_SET`` (the start), ``io.SEEK_CUR`` (the
+                       current position) or ``io.SEEK_END`` (the end of
+                       what has been written to the body so far)
+        :return: the new position
+        :raises ValueError: for an unknown ``whence`` or a position
+                            before the start
+        """
+        self._checkClosed()
+        if whence == io.SEEK_CUR:
+            offset += self._position
+        elif whence == io.SEEK_END:
+            offset += self._body._size
+        elif whence != io.SEEK_SET:
+            raise ValueError(f"invalid whence ({whence}, should be 0, 1 or 2)")
+        if offset < 0:
+            raise ValueError(f"negative seek position {offset}")
+        self._position = offset
+        return offset
+
+    def tell(self) -> int:
+        """
+        :return: the current position
+        """
+        self._checkClosed()
+        return self._position
 
 
 class SpooledBody:
@@ -729,19 +885,21 @@ class SpooledBody:
         6
         >>> body.file().read()
         b'abcdef'
-        >>> body.file().read(3)  # rewound on every call
+        >>> body.file().read(3)  # every call starts at the beginning
         b'abc'
         >>> body.close()
         >>> body.closed
         True
 
-    The temporary file is removed by :py:meth:`close` — or by leaving a
-    ``with`` block, or by closing the file object returned by
-    :py:meth:`file`, which is the same file. Garbage collection removes
-    it as a last resort only.
+    The temporary file is removed by :py:meth:`close` or by leaving a
+    ``with`` block. Garbage collection removes it as a last resort only.
 
-    Not safe for concurrent use: the write position, the file view and
-    the chunk iterations all share one file object.
+    Readers do not get in each other's way: every iteration of the body
+    and every file object from :py:meth:`file` has a position of its own,
+    so the body can be read by several consumers at once (two tasks
+    serving the same cached response, say), also while it is still being
+    written. The steps touching the one file behind the body are
+    serialized by a lock.
     """
 
     def __init__(
@@ -770,19 +928,18 @@ class SpooledBody:
         self._max_memory = max_memory
         self._chunk_size = chunk_size
         # max_size=0 turns off the automatic rollover: this class decides
-        # when to move to disk, so that awrite() can do it in a thread.
-        # The mode is "r+b" rather than the default "w+b" for the sake of
-        # consumers that look at the ``mode`` attribute of a file they
-        # are given: gzip.GzipFile(fileobj=...) would open for writing
-        self._file = _Spool(max_size=0, mode="r+b", dir=None if dir is None else os.fspath(dir))
+        # when to move to disk, so that awrite() can do it in a thread
+        self._file = _Spool(max_size=0, dir=None if dir is None else os.fspath(dir))
         self._size = 0
+        # one file object, one position: whoever uses it — the writer and
+        # every reader, possibly in different worker threads — moves the
+        # position and does its read or write as one step
+        self._lock = threading.Lock()
 
     @property
     def rolled(self) -> bool:
         """Whether the data has been moved from memory to the temporary
-        file. Besides a write exceeding ``max_memory`` this happens when
-        a consumer of :py:meth:`file` asks for a file descriptor
-        (``fileno()``)."""
+        file."""
         return self._file.rolled
 
     @property
@@ -799,20 +956,18 @@ class SpooledBody:
         :return: the number of bytes written (all of them)
         :raises ValueError: if the body is closed
         """
-        file = self._file
-        if file.closed:
-            raise ValueError("I/O operation on closed file")
-        if not file.rolled and self._size + len(data) > self._max_memory:
-            file.rollover()
-        # the readers (file(), chunks()) share this file object and leave
-        # its position wherever they stopped: an append goes to the end.
-        # Compared with tell() rather than always seeking, because a seek
-        # would flush the write buffer of the temporary file every time
-        if file.tell() != self._size:
-            file.seek(self._size)
-        file.write(data)
-        self._size += len(data)
-        return len(data)
+        with self._lock:
+            file = self._file
+            if file.closed:
+                raise ValueError("I/O operation on closed file")
+            if not file.rolled and self._size + len(data) > self._max_memory:
+                file.rollover()
+            # the readers leave the position wherever they stopped
+            if file.tell() != self._size:
+                file.seek(self._size)
+            file.write(data)
+            self._size += len(data)
+            return len(data)
 
     async def awrite(self, data: bytes) -> int:
         """
@@ -834,19 +989,23 @@ class SpooledBody:
 
     def file(self) -> IO[bytes]:
         """
-        The body as a binary file object: seekable, readable any number
-        of times, and rewound to the start by every call of this method.
+        The body as a binary file object: read-only, seekable, and
+        positioned at the start.
 
-        It is the body's own file, not a copy: closing it closes the body
-        (which is the way to discard the data when only the file object
-        is passed on), and reading it moves the position that
-        :py:meth:`chunks` and friends start from anew.
+        Every call returns a new, independent view with a position of its
+        own. It reads from the body, it is not the body's file: closing
+        it (or handing it to something that does, like
+        :py:class:`io.TextIOWrapper`) leaves the body as it is, and it
+        has no file descriptor (``fileno()``) — :py:func:`save_body`
+        puts the data into a real file. Once the body is closed, reading
+        the view raises a :py:class:`ValueError`.
 
         :return: the file object, positioned at the start
         :raises ValueError: if the body is closed
         """
-        self._file.seek(0)
-        return self._file
+        if self._file.closed:
+            raise ValueError("I/O operation on closed file")
+        return io.BufferedReader(_SpoolView(self))
 
     def content_length(self) -> Union[int, None]:
         """
@@ -854,28 +1013,48 @@ class SpooledBody:
         """
         return self._size
 
+    def _read_at(self, offset: int, size: int) -> bytes:
+        """
+        Read from a position of the caller's own.
+
+        :param offset: where to read
+        :param size: the number of bytes to read at most, ``-1`` for all
+                     up to the end
+        :return: the bytes read, empty at (or beyond) the end
+        :raises ValueError: if the body is closed
+        """
+        with self._lock:
+            file = self._file
+            if file.tell() != offset:
+                file.seek(offset)
+            return file.read(size)
+
     def chunks(self) -> Iterator[bytes]:
         """
         :return: the body from the start as an iterator of chunks of (up
                  to) the configured chunk size — re-iterable
         """
-        file = self.file()
-        while chunk := file.read(self._chunk_size):
+        offset = 0
+        while chunk := self._read_at(offset, self._chunk_size):
+            offset += len(chunk)
             yield chunk
 
     async def achunks(self) -> AsyncIterator[bytes]:
         """
         :return: the body from the start as an asynchronous iterator of
-                 chunks; once the data is in the temporary file, all file
-                 operations run in a worker thread
+                 chunks; once the data is in the temporary file, the
+                 reads run in a worker thread
         """
-        if not self._file.rolled:
-            # still in memory: nothing here can block
-            for chunk in self.chunks():
-                yield chunk
-            return
-        file = await _in_thread(self.file)
-        while chunk := await _in_thread(file.read, self._chunk_size):
+        offset = 0
+        while True:
+            if self._file.rolled:
+                chunk = await _in_thread(self._read_at, offset, self._chunk_size)
+            else:
+                # still in memory: nothing here can block
+                chunk = self._read_at(offset, self._chunk_size)
+            if not chunk:
+                return
+            offset += len(chunk)
             yield chunk
 
     def as_bytes(self) -> bytes:
@@ -883,7 +1062,7 @@ class SpooledBody:
         :return: the whole body — for a body spooled because of its size
                  this loads all of it into memory
         """
-        return self.file().read()
+        return self._read_at(0, -1)
 
     def close(self) -> None:
         """
@@ -891,7 +1070,8 @@ class SpooledBody:
         Safe to call any number of times; every other access raises a
         :py:class:`ValueError` afterwards.
         """
-        self._file.close()
+        with self._lock:
+            self._file.close()
 
     async def aclose(self) -> None:
         """
@@ -900,9 +1080,9 @@ class SpooledBody:
         when the calling task has been cancelled.
         """
         if self._file.rolled and not self._file.closed:
-            await _in_thread_shielded(self._file.close)
+            await _in_thread_shielded(self.close)
         else:
-            self._file.close()
+            self.close()
 
     def __enter__(self) -> "SpooledBody":
         """
@@ -1116,15 +1296,17 @@ def _open_and_write(
     opened: list[IO[bytes]], path: Union[str, "os.PathLike[str]"], mode: str, data: bytes
 ) -> None:
     """
-    Open a file, record it (see :py:func:`_open_into`) and write the
-    first data to it.
+    Open a file, record it and write the first data to it. The file
+    object is recorded instead of returned: a result handed back from a
+    worker thread gets lost if the task waiting for it is cancelled, and
+    nobody could close the file.
 
     :param opened: the list the file object is appended to
     :param path: the path of the file to open
     :param mode: the (binary) mode to open the file in
     :param data: the bytes to write
     """
-    _open_into(opened, path, mode)
+    opened.append(_open_binary(path, mode))
     _write_all(opened[0], data)
 
 

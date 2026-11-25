@@ -277,8 +277,10 @@ print(req.body_bytes())  # reads the stream — consumes a generator source
 iterable — e.g. an async generator proxying another stream. It is
 async-only: the synchronous `chunks()`/`as_bytes()` raise a
 `RuntimeError`. Every producer supports `achunks()` for asynchronous
-consumption (`FileBody` runs its file operations in the default thread
-pool, so the event loop is never blocked):
+consumption (`FileBody` runs its file operations in a worker thread —
+`asyncio.to_thread`, or trio's thread pool below trio 0.23 or later — so
+the event loop is never blocked; a read that does not return, like one
+from a pipe nobody writes to, does not stand in the way of a timeout):
 
 ```python
 import asyncio
@@ -329,7 +331,10 @@ Closing the body also closes a generator behind it, ahead of the
 callback: a generator that was read only in part gets to run its own
 `finally` blocks right away instead of at garbage collection. A body
 over a generator cannot be read after it has been closed; one over a
-list is not affected.
+list is not affected. A generator that is running at that moment —
+another task is waiting in it for the next chunk — is left alone: the
+callback releases what it reads from, which is how a stalled read is
+aborted from outside.
 
 ### Spooled bodies
 
@@ -355,7 +360,7 @@ with SpooledBody(max_memory=8) as body:
     # True 12
     print(list(body.chunks()) == list(body.chunks()))  # re-readable
     # True
-    file = body.file()  # seekable, rewound by every call
+    file = body.file()  # a seekable view, a new one per call
     file.seek(5)
     print(file.read())
     # b'1chunk2'
@@ -363,11 +368,15 @@ print(body.closed)  # leaving the block removed the temporary file
 # True
 ```
 
-The temporary file is removed by `close()`, by leaving the `with` block
-or by closing the file object (it is the body's own file, not a copy) —
-garbage collection is only the last resort. Because the file object is
-shared, reading it moves its position; `write()` appends at the end
-wherever a reader has left it.
+The temporary file is removed by `close()` or by leaving the `with`
+block — garbage collection is only the last resort.
+
+The file object from `file()` is a read-only view with a position of its
+own, and so is every iteration of the body. Several consumers can
+therefore read the same body at once — two tasks serving one cached
+response, say — and closing a view, or handing it to a wrapper that
+closes what it wraps (`io.TextIOWrapper`), leaves the body alone. A view
+has no file descriptor; `save_body()` puts the data into a real file.
 
 In asynchronous code use `awrite()`, `achunks()` and `aclose()` (or
 `async with`). While the data is in memory they run inline; once it is
@@ -453,7 +462,7 @@ print(resp == Response(200))
 a seekable binary file object — for consumers that read from a file,
 like streaming parsers or decompressors. For an in-memory body that is
 an in-memory file; a {py:class}`~action0.req.body.SpooledBody` hands out
-its own file; a {py:class}`~action0.req.body.FileBody` hands out the
+a read-only view of itself; a {py:class}`~action0.req.body.FileBody` hands out the
 file it wraps, or opens its path once — nothing is copied, the opened
 file is closed with the response, and closing it yourself does no harm
 (the next call opens it again); and a streamed body is read to its end
@@ -566,11 +575,13 @@ with Response(200, body=b"plain") as resp:  # nothing to release
 
 `copy()` shares the body, so closing one copy closes it for all of
 them. A body that can only be closed asynchronously (an
-`AsyncIterableBody` with an `aclose` callback) makes `close()` raise a
-`RuntimeError` instead of silently leaving the resource open. A `with`
-block left by an exception passes that exception on instead: the error
-that happened first is the one to see, and the failure to close is
-attached to it as a note.
+`AsyncIterableBody` with an `aclose` callback, or over an async
+generator that was read in part) makes `close()` raise a `RuntimeError`
+instead of silently leaving the resource open.
+
+When a `with` or `async with` block is left by an exception, that
+exception is the one you see: a failure to close does not replace it,
+but is attached to it as a note.
 
 ### Pickling
 

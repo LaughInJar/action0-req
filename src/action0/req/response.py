@@ -17,7 +17,6 @@ from .body import _body_bytes
 from .body import _body_producer
 from .body import _body_str
 from .body import _charset
-from .body import _file_of
 from .body import _rendered_body
 from .body import _SpooledStream
 from .body import asave_body
@@ -198,19 +197,18 @@ class Response:
 
         - bytes, str and :py:class:`~action0.req.body.BytesBody`: a new,
           independent in-memory file per call.
-        - :py:class:`~action0.req.body.SpooledBody`: the body's own file,
-          rewound (see :py:meth:`SpooledBody.file()
-          <action0.req.body.SpooledBody.file>`). Closing it discards the
-          data.
+        - :py:class:`~action0.req.body.SpooledBody`: a new read-only
+          view of the body per call (see :py:meth:`SpooledBody.file()
+          <action0.req.body.SpooledBody.file>`). Closing it does not
+          affect the body.
         - :py:class:`~action0.req.body.FileBody` over a seekable file
           object: that file object, rewound. It stays yours — neither
           the body nor :py:meth:`close` closes it.
-        - ``FileBody`` over a path: the file is opened, and a
-          ``FileBody`` holding the open file **replaces**
-          :py:attr:`body`. Further calls return the same file, rewound
-          (or a newly opened one, if you have closed it), and
-          :py:meth:`close` closes it. Nothing is copied, and the body
-          itself is still read through the path.
+        - ``FileBody`` over the path of a regular file: the file is
+          opened and kept by the body. Further calls return the same
+          file, rewound (or a newly opened one, if you have closed it),
+          and :py:meth:`close` closes it. Nothing is copied, and the
+          body itself is still read through the path.
         - any other producer (e.g. a streamed body): the stream is read
           to its end into a new ``SpooledBody``, which then **replaces**
           :py:attr:`body` — so the response stays readable, and
@@ -219,7 +217,10 @@ class Response:
           ``close()``), which releases its connection; one that can only
           be closed asynchronously is closed by :py:meth:`aclose`. This
           reads synchronously; in asynchronous code ask for a spooled
-          body upfront instead.
+          body upfront instead. If reading the stream fails, the error
+          passes through and nothing is kept — also when it is the
+          stream's own ``close`` callback that fails, at the very end:
+          from here that cannot be told from a stream breaking off.
 
         NOTE: the replacement happens in this response only. A
         :py:meth:`copy` made before shares the original producer, which
@@ -234,12 +235,11 @@ class Response:
             return body.file()
         if isinstance(body, (bytes, str, BytesBody)):
             return io.BytesIO(_body_bytes(body, _charset(self.headers)) or b"")
-        if isinstance(body, FileBody):
-            found = _file_of(body)
-            if found is not None:
-                # for a path: the body now holding the open file, so that
-                # close() releases it like everything else
-                self.body, file = found
+        # exactly FileBody: a subclass may produce something else than
+        # what is in the file, and is read through its chunks() below
+        if type(body) is FileBody:
+            file = body._file_view()
+            if file is not None:
                 return file
         close = getattr(body, "close", None)
         spool: SpooledBody
@@ -259,7 +259,9 @@ class Response:
             raise
         # replaced first, released afterwards: should the close() below
         # fail, the caller gets that error with the response in order —
-        # holding the spool, readable and closable
+        # holding the spool, readable and closable. (A producer closing
+        # itself at the end of chunks(), like IterableBody, fails in the
+        # loop above instead.)
         self.body = spool
         # the response no longer refers to the producer, so close() could
         # not reach it later: release what it holds now
@@ -385,18 +387,19 @@ class Response:
         """
         Close the response, see :py:meth:`close`.
 
-        A body that can only be closed asynchronously makes ``close()``
-        raise a :py:class:`RuntimeError`. Not so when the block is left
-        by an exception: that error is the one to report. It is not
-        replaced, the failure to close is attached to it as a note.
+        When the block is left by an exception, that error is the one
+        to report: a failure to close — for one, the
+        :py:class:`RuntimeError` of a body that can only be closed
+        asynchronously — does not replace it, but is attached to it as a
+        note.
         """
         if exc_value is None:
             self.close()
             return
         try:
             self.close()
-        except RuntimeError as error:
-            exc_value.add_note(f"closing the response failed as well: {error}")
+        except Exception as error:
+            exc_value.add_note(f"closing the response failed as well: {error!r}")
 
     async def __aenter__(self) -> "Response":
         """
@@ -412,9 +415,17 @@ class Response:
         traceback: Union[TracebackType, None],
     ) -> None:
         """
-        Close the response, see :py:meth:`aclose`.
+        Close the response, see :py:meth:`aclose`. As in ``with``, a
+        failure to close does not replace an exception the block was left
+        by, but is attached to it as a note.
         """
-        await self.aclose()
+        if exc_value is None:
+            await self.aclose()
+            return
+        try:
+            await self.aclose()
+        except Exception as error:
+            exc_value.add_note(f"closing the response failed as well: {error!r}")
 
     def copy(self, **overrides: Any) -> "Response":
         """

@@ -5,6 +5,7 @@ import io
 import json
 import sys
 import threading
+import time
 import unittest
 from collections.abc import AsyncGenerator
 from collections.abc import AsyncIterator
@@ -15,6 +16,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import IO
 from typing import Any
+from typing import Union
 from typing import cast
 from unittest import mock
 
@@ -58,13 +60,12 @@ def _recorded_thread_hops() -> Iterator[list[str]]:
 
         return dispatch
 
-    # the plain dispatch and the one for cleanup that survives cancellation
-    with (
-        mock.patch.object(body_module, "_in_thread", recording(body_module._in_thread)),
-        mock.patch.object(
-            body_module, "_in_thread_shielded", recording(body_module._in_thread_shielded)
-        ),
-    ):
+    # the plain dispatch, the one for cleanup that survives cancellation
+    # and the one for reads that may be left behind
+    with contextlib.ExitStack() as stack:
+        for name in ("_in_thread", "_in_thread_shielded", "_in_thread_abandonable"):
+            real = getattr(body_module, name)
+            stack.enter_context(mock.patch.object(body_module, name, recording(real)))
         yield hops
 
 
@@ -501,6 +502,24 @@ class IterableBodyCloseTestCase(unittest.TestCase):
         body.close()
         self.assertEqual(list(body.chunks()), [])
 
+    def test_close_while_the_generator_is_running(self) -> None:
+        """
+        Test that close() leaves a generator alone that is executing
+        right now — here it calls close() itself — instead of failing
+        with "generator already executing": the callback still runs.
+        """
+        released: list[bool] = []
+        bodies: list[IterableBody] = []
+
+        def source() -> Iterator[bytes]:
+            yield b"a"
+            bodies[0].close()
+            yield b"b"
+
+        bodies.append(IterableBody(source(), close=lambda: released.append(True)))
+        self.assertEqual(list(bodies[0].chunks()), [b"a", b"b"])
+        self.assertEqual(released, [True])
+
 
 class AsyncIterableBodyCloseTestCase(unittest.IsolatedAsyncioTestCase):
     """
@@ -589,6 +608,52 @@ class AsyncIterableBodyCloseTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.closed, ["generator", "closed"])
         self.assertEqual([chunk async for chunk in chunks], [])
 
+    async def test_aclose_while_another_task_reads(self) -> None:
+        """
+        Test that aclose() can be used to abort a read from outside: a
+        generator another task is waiting in is left alone — closing it
+        would raise "already running" — while the callback releases what
+        it reads from. The generator ends when its reader does.
+        """
+        waiting = asyncio.Event()
+
+        async def source() -> AsyncIterator[bytes]:
+            try:
+                yield b"a"
+                waiting.set()
+                await asyncio.sleep(3600)
+            finally:
+                self.closed.append("generator")
+
+        body = AsyncIterableBody(source(), aclose=self._release)
+
+        async def read() -> list[bytes]:
+            return [chunk async for chunk in body.achunks()]
+
+        reader = asyncio.ensure_future(read())
+        await waiting.wait()
+        await body.aclose()
+        self.assertEqual(self.closed, ["closed"])
+        reader.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await reader
+        self.assertEqual(self.closed, ["closed", "generator"])
+
+    async def test_sync_close_of_a_generator_read_in_part(self) -> None:
+        """
+        Test that the synchronous close() does not pass over an async
+        generator that has been started: only aclose() can run what it
+        holds in a ``finally`` block. One never started holds nothing.
+        """
+        body = AsyncIterableBody(self._source())
+        body.close()
+        chunks = body.achunks()
+        self.assertEqual(await anext(chunks), b"a")
+        with self.assertRaises(RuntimeError):
+            body.close()
+        await body.aclose()
+        body.close()
+
     async def test_sync_close(self) -> None:
         """
         Test that the synchronous close() refuses while the callback is
@@ -667,8 +732,19 @@ class SpooledBodyTestCase(unittest.TestCase):
                 self.assertEqual(file.read(2), b"ab")
                 file.seek(4)
                 self.assertEqual(file.read(), b"ef")
-                self.assertEqual(body.file().read(), b"abcdef")
-                self.assertIs(body.file(), file)
+                self.assertEqual(file.tell(), 6)
+                self.assertEqual(file.seek(-2, io.SEEK_END), 4)
+                self.assertEqual(file.seek(-1, io.SEEK_CUR), 3)
+                self.assertEqual(file.read(1), b"d")
+                with self.assertRaises(ValueError):
+                    file.seek(-1)
+                with self.assertRaises(ValueError):
+                    file.seek(0, 3)
+                # a view of its own per call, each starting at the beginning
+                other = body.file()
+                self.assertIsNot(other, file)
+                self.assertEqual(other.read(), b"abcdef")
+                self.assertEqual(file.tell(), 4)
 
     def test_reading_is_repeatable_and_chunked(self) -> None:
         """
@@ -711,18 +787,49 @@ class SpooledBodyTestCase(unittest.TestCase):
                 self.assertEqual(body.as_bytes(), b"aaaabbbbcc")
                 self.assertEqual(body.content_length(), 10)
 
-    def test_rolled_follows_a_rollover_by_the_file(self) -> None:
+    def test_file_is_a_read_only_view(self) -> None:
         """
-        Test that the body notices when the file moves to disk on its
-        own: asking the file object for a descriptor does that.
+        Test that the file object neither writes nor has a descriptor:
+        nothing done through it changes the body, whose size and place
+        (memory or disk) only write() decides.
         """
         with SpooledBody() as body:
             body.write(b"abc")
+            file = body.file()
+            self.assertTrue(file.readable())
+            self.assertFalse(file.writable())
+            with self.assertRaises(io.UnsupportedOperation):
+                file.write(b"x")
+            with self.assertRaises(io.UnsupportedOperation):
+                file.truncate(0)
+            with self.assertRaises(io.UnsupportedOperation):
+                file.fileno()
             self.assertFalse(body.rolled)
-            self.assertIsInstance(body.file().fileno(), int)
-            self.assertTrue(body.rolled)
-            body.write(b"def")
-            self.assertEqual(body.as_bytes(), b"abcdef")
+            self.assertEqual(body.content_length(), 3)
+            self.assertEqual(body.as_bytes(), b"abc")
+
+    def test_readers_do_not_disturb_each_other(self) -> None:
+        """
+        Test that every iteration and every file view has a position of
+        its own — overlapping readers each get the whole body, also what
+        is written while they read.
+        """
+        for max_memory in (1024, 0):
+            with self.subTest(max_memory=max_memory):
+                with SpooledBody(max_memory=max_memory, chunk_size=4) as body:
+                    body.write(b"0123456789abcdef")
+                    first = body.chunks()
+                    second = body.chunks()
+                    self.assertEqual(next(first), b"0123")
+                    self.assertEqual(next(second), b"0123")
+                    view = body.file()
+                    self.assertEqual(view.read(6), b"012345")
+                    self.assertEqual(next(first), b"4567")
+                    body.write(b"gh")
+                    self.assertEqual(b"".join(second), b"456789abcdefgh")
+                    self.assertEqual(b"".join(first), b"89abcdefgh")
+                    self.assertEqual(view.read(), b"6789abcdefgh")
+                    self.assertEqual(body.as_bytes(), b"0123456789abcdefgh")
 
     def test_file_feeds_gzip_and_json(self) -> None:
         """
@@ -800,27 +907,33 @@ class SpooledBodyTestCase(unittest.TestCase):
                     self.assertFalse(body.rolled)
                 self.assertEqual(body.content_length(), 0)
 
-    def test_file_descriptor_of_a_closed_body(self) -> None:
+    def test_file_of_a_closed_body(self) -> None:
         """
-        Test that asking the file of a closed body for a descriptor
-        raises without reopening it.
-        """
-        body = SpooledBody()
-        file = body.file()
-        body.close()
-        with self.assertRaises(ValueError):
-            file.fileno()
-        self.assertTrue(body.closed)
-
-    def test_closing_the_file_closes_the_body(self) -> None:
-        """
-        Test that the file view is the body's own file: closing it
-        discards the data.
+        Test that a file view cannot read from a body that has been
+        closed, and that closing the view afterwards is harmless.
         """
         body = SpooledBody()
         body.write(b"abc")
-        body.file().close()
+        file = body.file()
+        body.close()
+        with self.assertRaises(ValueError):
+            file.read()
+        file.close()
         self.assertTrue(body.closed)
+
+    def test_closing_the_file_leaves_the_body_alone(self) -> None:
+        """
+        Test that the file object is a view, not the body's file: closing
+        it — directly, or by a wrapper that closes what it wraps — does
+        not discard the data.
+        """
+        with SpooledBody() as body:
+            body.write(b"abc")
+            body.file().close()
+            with io.TextIOWrapper(body.file(), encoding="ascii") as text:
+                self.assertEqual(text.read(), "abc")
+            self.assertFalse(body.closed)
+            self.assertEqual(body.file().read(), b"abc")
 
     def test_context_manager(self) -> None:
         """
@@ -899,21 +1012,49 @@ class SpooledBodyAsyncTestCase(unittest.IsolatedAsyncioTestCase):
             await body.awrite(b"abc")
         self.assertTrue(body.closed)
 
-    async def test_threads_are_used_after_a_rollover_by_the_file(self) -> None:
+    async def test_concurrent_readers(self) -> None:
         """
-        Test that once the file has moved to disk on its own (a consumer
-        asked for its descriptor), writing, reading and closing run in
-        worker threads like after a rollover by size.
+        Test that tasks reading the same body at the same time — a cached
+        response served twice — each get all of it, in memory and from
+        the file (where the reads run in worker threads).
         """
-        body = SpooledBody()
-        await body.awrite(b"abc")
-        body.file().fileno()
-        with _recorded_thread_hops() as hops:
-            await body.awrite(b"def")
-            chunks = [chunk async for chunk in body.achunks()]
-            await body.aclose()
-        self.assertEqual(chunks, [b"abcdef"])
-        self.assertEqual(hops, ["write", "file", "read", "read", "close"])
+        data = bytes(range(256)) * 64
+        for max_memory in (len(data), 0):
+            with self.subTest(max_memory=max_memory):
+                async with SpooledBody(max_memory=max_memory, chunk_size=1000) as body:
+                    await body.awrite(data)
+
+                    async def read(body: SpooledBody = body) -> bytes:
+                        return b"".join([chunk async for chunk in body.achunks()])
+
+                    results = await asyncio.gather(read(), read(), read())
+                    self.assertEqual(results, [data, data, data])
+
+
+class OwnedFileTestCase(unittest.TestCase):
+    """
+    tests for :py:class:`action0.req.body._OwnedFile`, which decides who
+    closes the file FileBody.achunks() has opened
+    """
+
+    def test_release(self) -> None:
+        """
+        Test that the consumer is told to close a file that is open and
+        idle — not one that was never opened —, and that a read arriving
+        after the release finds nothing.
+        """
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "data.bin"
+            path.write_bytes(b"abc")
+
+            self.assertFalse(body_module._OwnedFile(path).release())
+
+            owned = body_module._OwnedFile(path)
+            owned.open()
+            self.assertEqual(owned.read(2), b"ab")
+            self.assertTrue(owned.release())
+            self.assertEqual(owned.read(2), b"")
+            owned.close()
 
 
 class InThreadTestCase(unittest.TestCase):
@@ -1153,7 +1294,38 @@ class TrioCancellationTestCase(unittest.TestCase):
 
         with _recorded_thread_hops() as hops:
             self.assertTrue(trio.run(main))
-        self.assertEqual(hops, ["_open_into", "read", "close"])
+        self.assertEqual(hops, ["open", "read", "close"])
+
+    def test_stalled_read_does_not_block_a_timeout(self) -> None:
+        """
+        Test that a read which does not return — a pipe nobody writes to
+        — is left behind when the deadline passes, instead of being
+        waited for.
+        """
+        gate = _Gate()
+
+        class _Stalled:
+            def seekable(self) -> bool:
+                return False
+
+            def read(self, size: int = -1) -> bytes:
+                gate.wait()
+                return b""
+
+        async def main() -> bool:
+            with trio.move_on_after(0.05) as scope:
+                async for _chunk in FileBody(cast("IO[bytes]", _Stalled())).achunks():
+                    pass  # pragma: no cover
+            return scope.cancelled_caught
+
+        started = time.monotonic()
+        try:
+            self.assertTrue(trio.run(main))
+            self.assertTrue(gate.started.is_set())
+            # long before the held read would give up by itself
+            self.assertLess(time.monotonic() - started, 5)
+        finally:
+            gate.release.set()
 
 
 class AsyncioCancellationTestCase(unittest.IsolatedAsyncioTestCase):
@@ -1254,6 +1426,73 @@ class AsyncioCancellationTestCase(unittest.IsolatedAsyncioTestCase):
                 await _cancel_while_held(self, task, gate)
             self.assertTrue(files[0].closed)
             self.assertEqual(self.path.read_bytes(), b"abc")
+
+    async def test_stalled_read_does_not_block_a_timeout(self) -> None:
+        """
+        Test that a read which does not return — a pipe nobody writes to
+        — is left behind when the task is cancelled, instead of being
+        waited for: a timeout has to work exactly then.
+        """
+        gate = _Gate()
+
+        class _Stalled:
+            def seekable(self) -> bool:
+                return False
+
+            def read(self, size: int = -1) -> bytes:
+                gate.wait()
+                return b""
+
+        async def read() -> list[bytes]:
+            body = FileBody(cast("IO[bytes]", _Stalled()))
+            return [chunk async for chunk in body.achunks()]
+
+        started = time.monotonic()
+        try:
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(read(), 0.05)
+            self.assertTrue(gate.started.is_set())
+            # long before the held read would give up by itself
+            self.assertLess(time.monotonic() - started, 5)
+        finally:
+            gate.release.set()
+
+    async def test_abandoned_read_closes_the_file(self) -> None:
+        """
+        Test that the file a path-based FileBody has opened is closed
+        although its consumer was cancelled during a read: not by the
+        consumer, which does not wait, but by the read left behind — as
+        soon as it returns.
+        """
+        gate = _Gate()
+        files: list[io.FileIO] = []
+
+        class _Held(io.FileIO):
+            def read(self, size: Union[int, None] = -1, /) -> bytes:
+                gate.wait()
+                return super().read(size)
+
+        def open_held(path: Any, mode: str = "rb") -> io.FileIO:
+            files.append(_Held(path, mode))
+            return files[-1]
+
+        async def read() -> list[bytes]:
+            return [chunk async for chunk in FileBody(self.path).achunks()]
+
+        self.path.write_bytes(b"abcdef")
+        try:
+            with mock.patch.object(body_module, "_open_binary", open_held):
+                with self.assertRaises(asyncio.TimeoutError):
+                    await asyncio.wait_for(read(), 0.05)
+            self.assertTrue(gate.started.is_set())
+            self.assertFalse(files[0].closed)
+        finally:
+            gate.release.set()
+        for _ in range(500):
+            if files[0].closed:
+                break
+            await asyncio.sleep(0.01)
+        self.assertTrue(files[0].closed)
 
 
 class SaveBodyTestCase(unittest.TestCase):
