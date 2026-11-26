@@ -80,6 +80,12 @@ print(req.as_str(separator="\n"))  # "\r\n" by default
 post = req.copy(method="POST", body='{"a": 1}')
 print(post.body_bytes())  # b'{"a": 1}'
 print(post)  # Request(POST https://api.example.com/items?page=2)
+
+# the URL is kept as it is written, up to the request line
+signed = Request("https://api.example.com/a%2Fb?sig=x%2By&flag")
+print(signed.as_str(separator="\n"))
+# GET /a%2Fb?sig=x%2By&flag HTTP/1.1
+# Host: api.example.com
 ```
 
 `Response` mirrors it for the server side — status (with reason phrase

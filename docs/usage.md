@@ -142,7 +142,8 @@ attribute (the URL a {py:class}`~action0.url.base.Url` from
 [action0-url](https://laughinjar.github.io/action0-url/), the headers a
 {py:class}`~action0.req.headers.Headers`). The URL can be passed as a
 string or an existing `Url` (which is copied); `query` replaces the URL's
-query like the `Url` constructor does; the method is uppercased:
+query like the `Url` constructor does (`None`, the default, leaves it
+alone; an empty mapping removes it); the method is uppercased:
 
 ```python
 from action0.req import Request
@@ -160,8 +161,43 @@ print(req.as_str(separator="\n"))
 `as_str()` renders the wire format: the request line with the origin-form
 target and the headers, deriving `Host` from the URL when none is set
 (like `Headers.as_str()` it does NOT redact secret values — `repr()`
-does). `copy()` returns an independent request, with keyword overrides
-for any constructor argument:
+does).
+
+The URL is kept the way it is written — its percent escapes and the
+spelling of its query are neither decoded nor re-encoded — and the
+target is that spelling, character for character, so a signed URL
+arrives on the wire unchanged. The derived `Host` is what the URL string
+has as well: a non-ASCII hostname IDNA-encoded, an IPv6 address in
+brackets:
+
+```python
+from action0.req import Request
+
+req = Request("https://bücher.example/a%2Fb?sig=x%2By&flag")
+print(req.url)
+# https://xn--bcher-kva.example/a%2Fb?sig=x%2By&flag
+print(req.as_str(separator="\n"))
+# GET /a%2Fb?sig=x%2By&flag HTTP/1.1
+# Host: xn--bcher-kva.example
+```
+
+Nothing is assumed about parts a URL string does not have. Without a
+scheme it is a relative reference: `"example.com/items"` is a path, not a
+host — write `"https://example.com/items"`. A request without a host has
+no `Host` line, and its target is always an absolute path:
+
+```python
+from action0.req import Request
+
+req = Request("example.com/items")
+print(req.url.hostname, req.url.path)
+# None example.com/items
+print(req.as_str())
+# GET /example.com/items HTTP/1.1
+```
+
+`copy()` returns an independent request, with keyword overrides for any
+constructor argument:
 
 ```python
 from action0.req import Request

@@ -5,7 +5,6 @@ from typing import Any
 from typing import Mapping
 from typing import Union
 
-from action0.url import Params
 from action0.url import Url
 from action0.url.params import ParamTypes
 
@@ -19,6 +18,56 @@ from .body import _rendered_body
 from .headers import Header
 from .headers import Headers
 from .headers import HeaderTypes
+
+# hostname of the placeholder authority a URL is rendered behind to read off
+# its request target, see _request_target()
+_ANCHOR = "x"
+
+
+def _request_target(url: Url) -> str:
+    """
+    The origin-form request target of a URL (:rfc:`9112`, section 3.2.1):
+    the path (with its path params) and the query, spelled exactly as
+    ``url.as_str()`` spells them — so the percent escapes of a signed URL
+    arrive on the wire unchanged.
+
+    :param url: the URL of the request
+    :return: the target, always starting with a "/"
+    """
+    # The Url renders its own path; rebuilding it from the decoded ``path``
+    # would lose the escapes ("/a%2Fb" -> "/a/b"). Behind an authority the
+    # path is written as it is, whereas a URL without one gets its path
+    # prefixed where it would be read as a host or a scheme ("//x" ->
+    # "/.//x"), hence the placeholder; userinfo and fragment are not part
+    # of the target.
+    anchored = url.copy(authority=_ANCHOR, username=None, password=None, fragment=None)
+    # a scheme cannot contain a "/", so this is the placeholder authority
+    target = anchored.as_str().partition(f"//{_ANCHOR}")[2]
+    # an empty path: "" or just "?query"
+    return target if target.startswith("/") else f"/{target}"
+
+
+def _host(url: Url) -> str:
+    """
+    The value of the ``Host`` header for a URL: hostname and port as they
+    are written in the URL string — a non-ASCII hostname IDNA-encoded, an
+    IPv6 address in brackets. ``url.authority`` is the readable form and
+    not what goes on the wire.
+
+    :param url: the URL of the request
+    :return: e.g. ``"example.com:8443"``, "" for a URL without a hostname
+    """
+    authority = url.copy(
+        scheme=None,
+        username=None,
+        password=None,
+        path=None,
+        path_params=None,
+        query=None,
+        fragment=None,
+    ).as_str()
+    # "//host:port", or "" for a URL without an authority
+    return authority[2:]
 
 
 class Method(StrEnum):
@@ -72,6 +121,10 @@ class Request:
         >>> req
         Request(GET https://api.example.com/items?page=2)
 
+    The URL is kept as it is written: nothing is assumed about parts it
+    does not have (no default scheme), and its percent escapes and the
+    spelling of its query survive up to the wire rendering.
+
     The body can be set as ``bytes``, ``str`` or a streaming
     :py:class:`~action0.req.body.BodyProducer` and retrieved in any of the
     three forms via :py:meth:`body_bytes`, :py:meth:`body_str` and
@@ -93,11 +146,17 @@ class Request:
         :param url: the URL to request, as a string or an existing
                     :py:class:`~action0.url.base.Url` (which is copied, so
                     the request owns its URL); ``None`` starts from an
-                    empty URL to be filled in via ``request.url``
+                    empty URL to be filled in via ``request.url``. A
+                    string is taken as it is: without a scheme it is a
+                    relative reference ("example.com/items" is a path,
+                    not a host)
         :param method: the HTTP method, e.g. a :py:class:`Method` member or
                        any string (uppercased on the way in)
         :param query: if given, replaces the query of the given URL — like
-                      the ``query`` argument of the ``Url`` constructor
+                      the ``query`` argument of the ``Url`` constructor,
+                      except that ``None`` leaves the URL's query alone
+                      (the ``Url`` constructor removes it then); an empty
+                      mapping or string removes it
         :param headers: the initial header lines, in any form accepted by
                         :py:class:`~action0.req.headers.Headers`
         :param body: the request body as ``bytes``, ``str`` or a streaming
@@ -116,7 +175,9 @@ class Request:
         else:
             self.url = Url(url)
         if query is not None:
-            self.url.query = Params(query)
+            # the Url builds its Params itself (as a copy), with the
+            # encoding its scheme calls for
+            self.url.query = query
 
         self.method: str = method.upper()
         self.headers = Headers(headers)
@@ -199,6 +260,20 @@ class Request:
         derived from the URL if none is set — and optionally the body.
         Secret header values are NOT redacted here, unlike in ``repr()``.
 
+        The target is the part of ``request.url.as_str()`` between the
+        authority and the fragment, character for character — percent
+        escapes are neither decoded nor re-encoded — and always an
+        absolute path ("/" for an empty one). The derived ``Host`` has the
+        hostname as the URL string has it: IDNA-encoded if it is not
+        ASCII, an IPv6 address in brackets.
+
+        Example::
+
+            >>> req = Request("https://bücher.example/a%2Fb?sig=x%2By&flag")
+            >>> print(req.as_str(separator="\n"))
+            GET /a%2Fb?sig=x%2By&flag HTTP/1.1
+            Host: xn--bcher-kva.example
+
         :param include_body: append a blank line and the body (as text,
                              via :py:meth:`body_str`); a
                              :py:class:`~action0.req.body.BodyProducer` is
@@ -206,16 +281,10 @@ class Request:
         :param separator: the string joining the lines (no trailing one)
         :return: e.g. ``"GET /items?page=2 HTTP/1.1\r\nHost: api.example.com"``
         """
-        # origin-form target: path (with path params) and query, no authority
-        target = Url(
-            path=self.url.path or "/",
-            path_params=self.url.path_params,
-            query=self.url.query,
-        ).as_str()
-
-        lines = [f"{self.method} {target} {self.http_version}"]
-        if Header.HOST not in self.headers and self.url.authority:
-            lines.append(f"Host: {self.url.authority}")
+        lines = [f"{self.method} {_request_target(self.url)} {self.http_version}"]
+        host = _host(self.url)
+        if Header.HOST not in self.headers and host:
+            lines.append(f"Host: {host}")
         if self.headers:
             lines.append(self.headers.as_str(separator))
         rendered = separator.join(lines)
@@ -229,9 +298,11 @@ class Request:
         """
         Requests are equal when their method, URL, headers, body and HTTP
         version are equal, each with the part's own equality semantics
-        (e.g. header name casing doesn't matter). The body is compared as
-        set: ``b"x"`` and ``"x"`` are different bodies. The
-        :py:attr:`meta` dict is metadata and not compared.
+        (e.g. header name casing doesn't matter; URLs are equal when they
+        are equivalent: ``%7E`` equals ``~``, but ``/a%2Fb`` is not
+        ``/a/b``). The body is compared as set: ``b"x"`` and ``"x"`` are
+        different bodies. The :py:attr:`meta` dict is metadata and not
+        compared.
 
         :param other: the Request to compare with
         :return: whether the requests are equal

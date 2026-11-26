@@ -10,7 +10,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
-    "action0-url>=0.1.0",
+    "action0-url>=0.2.0",
 ]
 keywords = ["http", "request", "response", "headers", "status", "manipulation"]
 classifiers = [
