@@ -204,11 +204,10 @@ class Response:
         - :py:class:`~action0.req.body.FileBody` over a seekable file
           object: that file object, rewound. It stays yours — neither
           the body nor :py:meth:`close` closes it.
-        - ``FileBody`` over the path of a regular file: the file is
-          opened and kept by the body. Further calls return the same
-          file, rewound (or a newly opened one, if you have closed it),
-          and :py:meth:`close` closes it. Nothing is copied, and the
-          body itself is still read through the path.
+        - ``FileBody`` over the path of a regular file: a newly opened
+          file per call, with a position of its own. Close it when you
+          are done; :py:meth:`close` closes those still open. Nothing is
+          copied.
         - any other producer (e.g. a streamed body): the stream is read
           to its end into a new ``SpooledBody``, which then **replaces**
           :py:attr:`body` — so the response stays readable, and
@@ -235,9 +234,9 @@ class Response:
             return body.file()
         if isinstance(body, (bytes, str, BytesBody)):
             return io.BytesIO(_body_bytes(body, _charset(self.headers)) or b"")
-        # exactly FileBody: a subclass may produce something else than
-        # what is in the file, and is read through its chunks() below
-        if type(body) is FileBody:
+        if isinstance(body, FileBody):
+            # None if there is no seekable file with the contents of the
+            # body: then it is read like any other stream below
             file = body._file_view()
             if file is not None:
                 return file

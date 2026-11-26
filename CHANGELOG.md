@@ -40,8 +40,7 @@ numbers follow [Semantic Versioning](https://semver.org/).
   with nothing left to release; it raises while the callback is pending.
 - trio support for asynchronous file I/O: `FileBody.achunks()` and the
   new asynchronous file operations use trio's thread pool when running
-  below trio (0.23 or later). Before, `FileBody.achunks()` worked on
-  asyncio only.
+  below trio. Before, `FileBody.achunks()` worked on asyncio only.
   Cleanup — closing a file, writing out what has arrived — also runs
   when the task has been cancelled.
 
@@ -49,8 +48,14 @@ numbers follow [Semantic Versioning](https://semver.org/).
 
 - `FileBody.achunks()` no longer leaves the file it opened unclosed when
   the consuming task is cancelled: the close also runs when the task is
-  cancelled repeatedly, as anyio does on a timeout, and a read left
-  behind in its worker thread closes the file when it returns.
+  cancelled repeatedly, as anyio does on a timeout.
+- `FileBody.achunks()` on asyncio: a cancelled read of a regular file or
+  a seekable file object is finished before the cancellation is passed
+  on, so it no longer moves the file position under the next reader. A
+  source that may block for good (a named pipe, a device, a non-seekable
+  file object) is still left behind at once — now in a daemon thread of
+  its own, which neither occupies the loop's thread pool nor delays its
+  shutdown, and which closes the file it opened.
 
 ## 0.1.1 — 2026-08-08
 
