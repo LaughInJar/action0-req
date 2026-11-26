@@ -26,10 +26,11 @@ from .body import _charset
 from .body import _close_body
 from .body import _close_on_exit
 from .body import _rendered_body
+from .headers import _LINE_END
 from .headers import Header
 from .headers import Headers
 from .headers import HeaderTypes
-from .headers import _check_safe
+from .headers import _check_token
 from .headers import _own_headers
 
 # hostname of the placeholder authority a URL is rendered behind to read off
@@ -83,10 +84,14 @@ def _host(url: Url) -> str:
     return authority[2:]
 
 
-# the blank line between the head of a message and its body, and the end
-# of a line — CRLF as on the wire, or a bare LF
+# the blank line between the head of a message and its body: two line ends
+# (see _LINE_END) — CRLF as on the wire, or a bare LF
 _BLANK_LINE = re.compile(r"\r?\n\r?\n")
-_LINE_END = re.compile(r"\r?\n")
+
+# what a Host header must not contain: it is a host and optionally a port,
+# and everything here would make it — put in front of the target — the
+# userinfo, the path, the query or the fragment of the URL
+_NOT_A_HOST = re.compile(r"[\s/?#@\\]")
 
 
 def _split_message(text: str) -> tuple[str, str, Union[str, None]]:
@@ -139,9 +144,10 @@ class Method(StrEnum):
 class Request:
     r"""
     Python representation of an HTTP request: method, URL, headers, body
-    and HTTP version — every part a plain mutable attribute
+    and HTTP version — every part a mutable attribute
     (:py:class:`~action0.url.base.Url` for the URL,
-    :py:class:`~action0.req.headers.Headers` for the headers).
+    :py:class:`~action0.req.headers.Headers` for the headers; a string
+    or a mapping assigned to them is converted).
 
     Example::
 
@@ -199,21 +205,17 @@ class Request:
     """The (casefolded) names of the query parameters whose values carry
     secrets and are shown as ``***`` by ``repr()`` — the counterpart of
     :py:attr:`Headers.secret_names <action0.req.headers.Headers.secret_names>`.
-    Override on a subclass or instance to redact more (or fewer)
-    parameters. Only ``repr()`` redacts: ``request.url`` and
-    :py:meth:`as_str` keep the values."""
-
-    url: Url
-    """The URL of the request, the request's own
-    :py:class:`~action0.url.base.Url` instance."""
-
-    headers: Headers
-    """The header fields, the request's own
-    :py:class:`~action0.req.headers.Headers` instance."""
+    A fragment written like a query (``#access_token=...``, as the OAuth
+    implicit flow returns it) is redacted the same way. Override on a
+    subclass or instance to redact more (or fewer) parameters;
+    :py:meth:`copy` keeps an instance's own set. Only ``repr()``
+    redacts: ``request.url`` and :py:meth:`as_str` keep the values."""
 
     body: Union[BodyTypes, None]
     """The body as it was set: ``bytes``, ``str``, a
-    :py:class:`~action0.req.body.BodyProducer` or ``None``."""
+    :py:class:`~action0.req.body.BodyProducer` or ``None``. Nothing else
+    is a body — for a ``bytearray`` or a ``memoryview`` the accessors
+    raise a :py:class:`TypeError`: pass ``bytes(...)``."""
 
     http_version: str
     """The protocol version rendered in the request line."""
@@ -289,6 +291,7 @@ class Request:
             self.url.query = query
 
         self.method = method
+        # copied on ingestion like the URL; the setter takes it as it is
         self.headers = _own_headers(headers)
         self.body = body
         self.http_version = http_version
@@ -314,6 +317,55 @@ class Request:
     @method.setter
     def method(self, value: str) -> None:
         self.__dict__["method"] = value.upper()
+
+    @property
+    def url(self) -> Url:
+        """
+        The URL of the request, a :py:class:`~action0.url.base.Url`. A
+        ``Url`` that is assigned becomes the request's URL as it is
+        (only the constructor copies); a string is parsed, and ``None``
+        gives an empty URL — as in the constructor::
+
+            >>> req = Request("https://api.example.com/items")
+            >>> req.url = "https://api.example.com/users?page=2"
+            >>> req.url.path
+            '/users'
+
+        Anything else raises a :py:class:`TypeError`.
+        """
+        # in the instance dict under its public name, like the method
+        return cast("Url", self.__dict__["url"])
+
+    @url.setter
+    def url(self, value: Union[str, Url, None]) -> None:
+        if value is None:
+            value = Url()
+        elif isinstance(value, str):
+            value = Url(value)
+        elif not isinstance(value, Url):
+            raise TypeError(f"the URL must be a Url or a str, got {type(value).__name__}")
+        self.__dict__["url"] = value
+
+    @property
+    def headers(self) -> Headers:
+        """
+        The header fields, a :py:class:`~action0.req.headers.Headers`. A
+        ``Headers`` instance that is assigned becomes the request's
+        headers as it is (only the constructor copies); every other form
+        the ``Headers`` constructor accepts — a mapping, a list of
+        tuples, a raw header block, ``None`` for none — is converted, so
+        the lookups stay case-insensitive::
+
+            >>> req = Request("https://api.example.com/items")
+            >>> req.headers = {"accept": "application/json"}
+            >>> req.headers["Accept"]
+            'application/json'
+        """
+        return cast("Headers", self.__dict__["headers"])
+
+    @headers.setter
+    def headers(self, value: Union[HeaderTypes, None]) -> None:
+        self.__dict__["headers"] = value if isinstance(value, Headers) else Headers(value)
 
     @classmethod
     def from_str(cls, text: str, *, scheme: Union[str, None] = None) -> Self:
@@ -344,7 +396,18 @@ class Request:
 
         The ``Host`` header stays among the headers, and
         ``Request.from_str(text).as_str(...)`` gives the text back as it
-        was (with ``include_body=True`` and the separator of the text).
+        was (with ``include_body=True`` and the separator of the text) —
+        but for what a request always is here: the method is uppercased,
+        and a request without a ``Host`` header whose target names the
+        host (the absolute URL, the ``host:port`` of a ``CONNECT``) is
+        rendered with the ``Host`` derived from it.
+
+        The ``Host`` header has to be what it is called, a host and
+        optionally a port. A value with more to it (``example.com/path``,
+        ``trusted.com@evil.com``) would end up as the path or the
+        userinfo of the URL, and with two ``Host`` lines it is anybody's
+        guess which one counts: both are refused, as a server refuses
+        them (:rfc:`9112`, section 3.2).
 
         :param text: the request as text; the body is whatever follows
                      the first blank line and is taken as a ``str``
@@ -355,7 +418,8 @@ class Request:
         :return: the request
         :raises ValueError: if the request line does not consist of a
                             method, a target and a version, or a header
-                            line or the URL is invalid
+                            line, the ``Host`` header or the URL is
+                            invalid
         """
         start, fields, body = _split_message(text)
         parts = start.split(" ")
@@ -363,7 +427,14 @@ class Request:
             raise ValueError(f"invalid request line: {start!r}")
         method, target, http_version = parts
         headers = Headers(fields)
-        host = headers.get(Header.HOST, "")
+        hosts = headers.get_all(Header.HOST)
+        if len(hosts) > 1:
+            raise ValueError(f"more than one Host header: {hosts!r}")
+        host = hosts[0] if hosts else ""
+        if _NOT_A_HOST.search(host):
+            raise ValueError(
+                f"invalid Host header, expected a host and optionally a port: {host!r}"
+            )
 
         explicit: Union[str, None] = None
         if target.startswith("/"):
@@ -373,8 +444,7 @@ class Request:
             anchored = bool(host) or target.startswith("//")
             url = Url(f"//{host}{target}" if anchored else target)
             if _request_target(url) != target:
-                # a Host that is more than a host, a spelling the Url
-                # does not keep: what was written wins
+                # a spelling the Url does not keep: what was written wins
                 explicit = target
         else:
             explicit = target
@@ -546,7 +616,10 @@ class Request:
         replaced. The body is carried over as-is — in particular a
         :py:class:`~action0.req.body.BodyProducer` is shared, not copied;
         the ``meta`` values are shared too (shallow copy). The copy is of
-        the same class as this request, and so are its headers.
+        the same class as this request, and so are its headers. Whatever
+        else has been set on this instance goes along as well — a
+        :py:attr:`secret_params` of its own, so the copy redacts what
+        this request redacts.
 
         Example::
 
@@ -567,7 +640,12 @@ class Request:
             "meta": self.meta,
         }
         kwargs.update(overrides)
-        return self.__class__(**kwargs)
+        duplicate = self.__class__(**kwargs)
+        # the constructor has set the parts of a request; what it knows
+        # nothing about is taken over (shared, like the body)
+        for name, value in self.__dict__.items():
+            duplicate.__dict__.setdefault(name, value)
+        return duplicate
 
     def as_str(self, include_body: bool = False, separator: str = "\r\n") -> str:
         r"""
@@ -607,13 +685,18 @@ class Request:
         :param separator: the string joining the lines (no trailing one)
         :return: e.g. ``"GET /items?page=2 HTTP/1.1\r\nHost: api.example.com"``
         :raises ValueError: if the method, the target or the HTTP version
-                            contains a CR, an LF or a NUL — it would
-                            start a line of its own
+                            is empty or contains a CR, an LF or a NUL —
+                            it would start a line of its own — or any
+                            other whitespace: the three are separated by
+                            single spaces, a space inside one of them
+                            would make it two
+        :raises TypeError: if the body is a ``bytearray`` or a
+                           ``memoryview`` (with ``include_body``)
         """
         target = self.target if self.target is not None else _request_target(self.url)
-        _check_safe(self.method, "method")
-        _check_safe(target, "request target")
-        _check_safe(self.http_version, "HTTP version")
+        _check_token(self.method, "method")
+        _check_token(target, "request target")
+        _check_token(self.http_version, "HTTP version")
         lines = [f"{self.method} {target} {self.http_version}"]
         host = _host(self.url)
         if Header.HOST not in self.headers and host:
@@ -658,8 +741,9 @@ class Request:
         """
         :return: the method and the URL, with the password redacted like
                  ``repr(Url)`` does and the values of the
-                 :py:attr:`secret_params` query parameters shown as
-                 ``***``; headers and body are left out, so no secret
+                 :py:attr:`secret_params` query parameters (also in a
+                 fragment written like a query) shown as ``***``;
+                 headers and body are left out, so no secret
                  header values can leak. ``str()`` falls back to this
                  representation — the wire rendering is only available
                  explicitly via :py:meth:`as_str`.
@@ -682,17 +766,33 @@ class Request:
 
         :param url: the URL string as rendered by the Url
         :return: the URL string with ``name=***`` for the secret
-                 parameters
+                 parameters, in the query and in the fragment
         """
         # neither path nor userinfo can contain a raw "?" or "#"
         main, hash_mark, fragment = url.partition("#")
         head, question_mark, query = main.partition("?")
-        if not question_mark:
-            return url
+        # a fragment can carry parameters as well: the tokens of the
+        # OAuth implicit flow ("#access_token=..."), the query of a
+        # client-side route ("#/callback?token=...")
+        route, fragment_mark, fragment_query = fragment.partition("?")
+        return (
+            f"{head}{question_mark}{self._redact_pairs(query)}"
+            f"{hash_mark}{self._redact_pairs(route)}"
+            f"{fragment_mark}{self._redact_pairs(fragment_query)}"
+        )
+
+    def _redact_pairs(self, query: str) -> str:
+        """
+        :param query: ``name=value`` pairs joined by ``"&"``, as they are
+                      written in the URL
+        :return: the same with ``name=***`` for the
+                 :py:attr:`secret_params`; a text without such pairs
+                 comes back as it is
+        """
         pairs: list[str] = []
         for pair in query.split("&"):
             name, equals, _ = pair.partition("=")
             if equals and unquote_plus(name).casefold() in self.secret_params:
                 pair = f"{name}=***"
             pairs.append(pair)
-        return f"{head}?{'&'.join(pairs)}{hash_mark}{fragment}"
+        return "&".join(pairs)

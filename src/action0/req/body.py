@@ -13,9 +13,11 @@ import stat
 import sys
 import tempfile
 import threading
+from types import FrameType
 from types import TracebackType
 from typing import IO
 from typing import Any
+from typing import AsyncGenerator
 from typing import AsyncIterable
 from typing import AsyncIterator
 from typing import Awaitable
@@ -31,6 +33,7 @@ from typing import runtime_checkable
 
 from .headers import Header
 from .headers import Headers
+from .headers import _split_elements
 
 
 @runtime_checkable
@@ -287,10 +290,12 @@ async def _dispatch(call: Callable[[], _T], *, shield: bool = False, abandon: bo
             raise
         run_sync = trio.to_thread.run_sync
         if abandon:
-            # the keyword got its name with trio 0.23
-            parameters = inspect.signature(run_sync).parameters
-            keyword = "abandon_on_cancel" if "abandon_on_cancel" in parameters else "cancellable"
-            return cast("_T", await run_sync(call, **{keyword: True}))
+            # not trio's default limiter: a thread that is left behind
+            # keeps its place there until its call returns, and enough
+            # stalled reads would lock every other user of trio's thread
+            # pool out — this library's own cleanup included
+            options = {_abandon_keyword(run_sync): True}
+            return cast("_T", await run_sync(call, limiter=_UNLIMITED, **options))
         # trio waits for a thread that has started by itself, and
         # delivers a cancellation at the next checkpoint after it
         if not shield:
@@ -321,6 +326,41 @@ async def _dispatch(call: Callable[[], _T], *, shield: bool = False, abandon: bo
     if cancelled is not None:
         raise cancelled
     return future.result()
+
+
+@functools.lru_cache(maxsize=2)
+def _abandon_keyword(run_sync: Callable[..., Any]) -> str:
+    """
+    :param run_sync: trio's ``to_thread.run_sync``
+    :return: the name of its keyword for leaving the thread behind on
+             cancellation: ``abandon_on_cancel``, or ``cancellable``
+             before trio 0.23. Looked up once, not for every call
+    """
+    parameters = inspect.signature(run_sync).parameters
+    return "abandon_on_cancel" if "abandon_on_cancel" in parameters else "cancellable"
+
+
+class _Unlimited:
+    """
+    The limiter for the calls that trio may leave behind (what trio calls
+    a ``CapacityLimiter``-like object): it never makes a call wait. As on
+    asyncio, where such a call gets a daemon thread of its own, their
+    number is not bounded — a bound would be used up by the calls that
+    never return.
+    """
+
+    async def acquire_on_behalf_of(self, borrower: object) -> None:
+        """
+        :param borrower: the call that asks for a thread
+        """
+
+    def release_on_behalf_of(self, borrower: object) -> None:
+        """
+        :param borrower: the call whose thread has finished
+        """
+
+
+_UNLIMITED = _Unlimited()
 
 
 class _DaemonThreads:
@@ -399,11 +439,17 @@ async def _in_daemon_thread(loop: asyncio.AbstractEventLoop, call: Callable[[], 
     behind. Being a daemon, it holds up neither the shutdown of the loop
     nor the exit of the interpreter.
 
+    The function runs with a copy of the caller's context, as in the
+    loop's thread pool: it sees the context variables of the task that
+    waits for it, and what it sets stays in the copy — the thread goes
+    on to serve other callers.
+
     :param loop: the running event loop
     :param call: the blocking function, with its arguments bound
     :return: what the function returned
     """
     future: asyncio.Future[_T] = loop.create_future()
+    context = contextvars.copy_context()
 
     def deliver(result: Union[_T, None], error: Union[BaseException, None]) -> None:
         if future.done():
@@ -416,7 +462,10 @@ async def _in_daemon_thread(loop: asyncio.AbstractEventLoop, call: Callable[[], 
 
     def run() -> Callable[[], None]:
         try:
-            outcome: tuple[Union[_T, None], Union[BaseException, None]] = (call(), None)
+            outcome: tuple[Union[_T, None], Union[BaseException, None]] = (
+                context.run(call),
+                None,
+            )
         except BaseException as error:
             outcome = (None, error)
 
@@ -446,6 +495,13 @@ def _open_binary(path: Union[str, "os.PathLike[str]"], mode: str = "rb") -> IO[b
     :return: the opened binary file object
     """
     return cast("IO[bytes]", open(path, mode))
+
+
+# guards the list of the files a FileBody has opened for
+# Response.body_file(): abody_file() looks them up in worker threads. One
+# lock for all bodies — it is held for a moment, and a lock of its own
+# would keep a FileBody from being pickled
+_VIEWS_LOCK = threading.Lock()
 
 
 class _OwnedFile:
@@ -703,8 +759,9 @@ class FileBody:
         if not stat.S_ISREG(os.stat(self._path).st_mode):
             return None
         view = _open_binary(self._path)
-        # forget those closed by their users, remember this one
-        self._views = [*(file for file in self._views if not file.closed), view]
+        with _VIEWS_LOCK:
+            # forget those closed by their users, remember this one
+            self._views = [*(file for file in self._views if not file.closed), view]
         return view
 
     def close(self) -> None:
@@ -717,7 +774,8 @@ class FileBody:
 
         Safe to call any number of times, and the body stays readable.
         """
-        views, self._views = self._views, []
+        with _VIEWS_LOCK:
+            views, self._views = self._views, []
         for view in views:
             view.close()
 
@@ -772,7 +830,81 @@ def _next_chunk(iterator: Iterator[bytes]) -> Union[bytes, None]:
     return next(iterator, None)
 
 
-class IterableBody:
+def _called_from(frame: Union[FrameType, None]) -> bool:
+    """
+    :param frame: the frame of a generator (``gi_frame``, ``ag_frame``)
+    :return: whether the caller is code of that generator, however deep
+             in the calls it makes — for a generator that is running: it
+             is this thread, or this task, that runs it
+    """
+    current = inspect.currentframe()
+    while current is not None:
+        if current is frame:
+            return True
+        current = current.f_back
+    return False
+
+
+class _SingleUse:
+    """
+    What :py:class:`IterableBody` and :py:class:`AsyncIterableBody` keep
+    track of in the same way: whether the source can be read once only,
+    whether that has happened, and whether the body was closed under a
+    read.
+    """
+
+    def __init__(self, *, single_use: bool, has_callback: bool) -> None:
+        """
+        :param single_use: whether the source is an iterator, which hands
+                           out its items once; a list (or any other
+                           container) starts anew for every read
+        :param has_callback: whether the body was given a callback that
+                             releases what the source reads from
+        """
+        self._single_use = single_use
+        self._has_callback = has_callback
+        # for a single-use source: whether a read has started, and
+        # whether the body has been closed
+        self._read = False
+        self._closed = False
+        # whether a read is under way, and whether closing the body has
+        # ended the stream under it
+        self._reading = False
+        self._cut = False
+
+    def _start_read(self) -> None:
+        """
+        :raises RuntimeError: if the source is single-use and the body
+                              has been read or closed before
+        """
+        if self._single_use:
+            _check_unread(self._read, self._closed)
+            self._read = True
+        self._reading = True
+
+    def _check_complete(self) -> None:
+        """
+        To be called where the source has ended by itself.
+
+        :raises RuntimeError: if the body was closed while it was read:
+                              that is why the source has ended, and what
+                              it delivered is not known to be all of it
+        """
+        if self._cut:
+            raise RuntimeError(_CLOSED_MIDWAY)
+
+    def _cuts_a_read(self, frame: Union[FrameType, None]) -> bool:
+        """
+        :param frame: the frame of the generator behind the body
+        :return: whether closing the body now ends the stream under
+                 somebody who reads it — as opposed to nobody reading,
+                 and to the generator itself closing the body on its way
+                 out, which is its regular end
+        """
+        return self._reading and not _called_from(frame)
+
+
+class IterableBody(_SingleUse):
     """
     A :py:class:`BodyProducer` wrapping an iterable of byte chunks, e.g.
     a generator. The total length is unknown (:py:meth:`content_length`
@@ -845,21 +977,10 @@ class IterableBody:
                 "IterableBody takes an iterable of byte chunks, got a single "
                 f"{type(iterable).__name__}: put it in a list, or use BytesBody"
             )
+        super().__init__(single_use=isinstance(iterable, Iterator), has_callback=close is not None)
         self._iterable = iterable
         self._close = close
-        self._has_callback = close is not None
         self._threaded = threaded
-        # an iterator hands out its items once; a list (or any other
-        # container) starts anew for every read
-        self._single_use = isinstance(iterable, Iterator)
-        # for a single-use source: whether a read has started, and
-        # whether the body has been closed
-        self._read = False
-        self._closed = False
-        # whether a read is under way, and whether close() has ended the
-        # stream under it
-        self._reading = False
-        self._cut = False
 
     def content_length(self) -> Union[int, None]:
         """
@@ -877,14 +998,12 @@ class IterableBody:
                               the body was closed while this read was
                               under way
         """
-        if self._single_use:
-            _check_unread(self._read, self._closed)
-            self._read = True
-        self._reading = True
+        self._start_read()
         try:
+            # closes the iterator of a re-iterable source too, should
+            # the consumer give up early
             yield from self._iterable
-            if self._cut:
-                raise RuntimeError(_CLOSED_MIDWAY)
+            self._check_complete()
         finally:
             self._reading = False
             self.close()
@@ -897,30 +1016,29 @@ class IterableBody:
                  the iteration ends, for whatever reason
         :raises RuntimeError: as for :py:meth:`chunks`
         """
-        if self._single_use:
-            _check_unread(self._read, self._closed)
-            self._read = True
-        self._reading = True
+        self._start_read()
+        # the source itself if that is an iterator; for a re-iterable
+        # source an iterator of this read's own
+        iterator: Union[Iterator[bytes], None] = None
         try:
+            iterator = iter(self._iterable)
             if self._threaded:
-                iterator = iter(self._iterable)
                 # abandonable: an iterable that blocks may block for
                 # good, and must not stand in the way of a timeout
                 while (chunk := await _in_thread_abandonable(_next_chunk, iterator)) is not None:
                     yield chunk
             else:
-                for chunk in self._iterable:
+                for chunk in iterator:
                     yield chunk
-            if self._cut:
-                raise RuntimeError(_CLOSED_MIDWAY)
+            self._check_complete()
         finally:
             self._reading = False
             if self._threaded:
                 # closing a generator runs its cleanup, which blocks like
                 # the generator does
-                await _in_thread_shielded(self._close_after_threaded_read)
+                await _in_thread_shielded(self._close_after_read, iterator)
             else:
-                self.close()
+                self._close_after_read(iterator)
 
     def as_bytes(self) -> bytes:
         """
@@ -950,47 +1068,70 @@ class IterableBody:
                               is no callback that could stop it: nothing
                               would be released
         """
+        self._release(strict=True)
+
+    def _release(self, *, strict: bool) -> None:
+        """
+        What :py:meth:`close` does.
+
+        :param strict: whether to raise if the generator is running and
+                       there is no callback to stop it. Not at the end
+                       of a read with ``threaded=True``: a consumer that
+                       was cancelled has left its worker thread behind,
+                       which may still be in the generator, and an error
+                       would take the place of the cancellation. The
+                       generator ends when that read returns
+        :raises RuntimeError: see :py:meth:`close`
+        """
         # swap before calling, so a failing or re-entrant callback cannot
         # run a second time
         close, self._close = self._close, None
         try:
             # generators only: closing one that is exhausted or abandoned
             # does what the garbage collector would do later. Any other
-            # iterable with a close() may well be meant to live on. And
-            # not one that is running right now (in another thread, or
-            # calling this very method): that would raise, and it ends
-            # by itself once the callback has released what it reads
+            # iterable with a close() may well be meant to live on
             source = self._iterable
             if inspect.isgenerator(source):
-                if not source.gi_running:
-                    # a reader waiting between two chunks finds the
-                    # generator at its end, and must not take that for
-                    # the end of the body
-                    self._cut = self._cut or self._reading
-                    source.close()
-                elif not self._has_callback:
-                    raise RuntimeError(
-                        "the body is being read right now and has no close callback: "
-                        "closing it would release nothing"
-                    )
+                # whoever reads right now — waiting between two chunks,
+                # or in the generator in another thread — may see the
+                # generator end as if the body were complete: closed
+                # here, or left without what it reads by the callback
+                was_cut = self._cut
+                self._cut = was_cut or self._cuts_a_read(source.gi_frame)
+                # one that is running right now (in another thread, or
+                # calling this very method) cannot be closed: it ends by
+                # itself once the callback has released what it reads
+                if not _close_generator(source) and not self._has_callback:
+                    # nothing is closed, the read goes on undisturbed
+                    self._cut = was_cut
+                    if strict:
+                        raise RuntimeError(
+                            "the body is being read right now and has no close callback: "
+                            "closing it would release nothing"
+                        )
             self._closed = True
         finally:
             if close is not None:
                 close()
 
-    def _close_after_threaded_read(self) -> None:
+    def _close_after_read(self, iterator: Union[Iterator[bytes], None]) -> None:
         """
-        :py:meth:`close` for the end of a read with ``threaded=True``. A
-        consumer that was cancelled has left its worker thread behind,
-        which may still be in the generator; without a callback nothing
-        can stop it, and close() would raise over the cancellation. The
-        generator ends when that read returns.
+        The end of a read by :py:meth:`achunks`: close the body, and the
+        generator this read has got from a re-iterable source (an object
+        whose ``__iter__`` is a generator function) — the consumer may
+        have given up before its end, and it is nobody else's to close.
+
+        :param iterator: the iterator of the read, ``None`` if the
+                         source did not even hand one out
         """
-        source = self._iterable
-        if inspect.isgenerator(source) and source.gi_running and not self._has_callback:
-            self._closed = True
-            return
-        self.close()
+        try:
+            if iterator is not self._iterable and inspect.isgenerator(iterator):
+                # if it is running, a worker thread left behind is in it
+                _close_generator(iterator)
+        finally:
+            # after a read in a worker thread that thread may still be in
+            # the source, see _release()
+            self._release(strict=not self._threaded)
 
     def __enter__(self) -> "IterableBody":
         """
@@ -1016,7 +1157,30 @@ class IterableBody:
         return f"{self.__class__.__name__}({type(self._iterable).__name__})"
 
 
-class AsyncIterableBody:
+def _close_generator(generator: Any) -> bool:
+    """
+    Close a generator unless it is running.
+
+    :param generator: the generator
+    :return: whether it has been closed; ``False`` if it is running
+             right now, in another thread or as the caller of this
+    :raises BaseException: whatever the cleanup of the generator raises
+    """
+    if generator.gi_running:
+        return False
+    try:
+        generator.close()
+    except ValueError:
+        # "generator already executing": a worker thread that had been
+        # handed the next chunk has entered it since the check above
+        if generator.gi_running:
+            return False
+        # the generator's own ValueError
+        raise
+    return True
+
+
+class AsyncIterableBody(_SingleUse):
     """
     A :py:class:`BodyProducer` wrapping an asynchronous iterable of byte
     chunks, e.g. an async generator proxying another stream. The total
@@ -1047,18 +1211,17 @@ class AsyncIterableBody:
         :param aclose: called (and awaited) once to release the resource
                        behind the iterable, see :py:meth:`aclose`
         """
+        super().__init__(
+            single_use=isinstance(aiterable, AsyncIterator), has_callback=aclose is not None
+        )
         self._aiterable = aiterable
         self._aclose = aclose
-        self._has_callback = aclose is not None
-        # whether an async generator behind the body has been started and
-        # not closed yet: it may hold a resource in a ``finally`` block
+        # whether an async generator given as the source has been started
+        # and not closed yet: it may hold a resource in a ``finally``
+        # block. And the same for the generators that the reads of a
+        # re-iterable source have got from it: how many are still open
         self._open = False
-        # as in IterableBody
-        self._single_use = isinstance(aiterable, AsyncIterator)
-        self._read = False
-        self._closed = False
-        self._reading = False
-        self._cut = False
+        self._open_reads = 0
 
     def content_length(self) -> Union[int, None]:
         """
@@ -1084,19 +1247,33 @@ class AsyncIterableBody:
                               the body was closed while this read was
                               under way
         """
-        if self._single_use:
-            _check_unread(self._read, self._closed)
-            self._read = True
-        self._open = inspect.isasyncgen(self._aiterable)
-        self._reading = True
+        self._start_read()
+        # the generator this read gets from a re-iterable source (an
+        # object whose ``__aiter__`` is an async generator function)
+        own: Union[AsyncGenerator[Any, Any], None] = None
         try:
-            async for chunk in self._aiterable:
+            iterator = aiter(self._aiterable)
+            if iterator is self._aiterable:
+                self._open = inspect.isasyncgen(iterator)
+            elif inspect.isasyncgen(iterator):
+                own = iterator
+                self._open_reads += 1
+            async for chunk in iterator:
                 yield chunk
-            if self._cut:
-                raise RuntimeError(_CLOSED_MIDWAY)
+            self._check_complete()
         finally:
             self._reading = False
-            await self.aclose()
+            try:
+                if own is not None:
+                    # the consumer may have given up before its end, and
+                    # nothing closes an async generator that is merely
+                    # dropped before the loop gets around to it
+                    try:
+                        await own.aclose()
+                    finally:
+                        self._open_reads -= 1
+            finally:
+                await self.aclose()
 
     def as_bytes(self) -> bytes:
         """
@@ -1118,7 +1295,7 @@ class AsyncIterableBody:
                               that has been started, can only be closed
                               by awaiting — use :py:meth:`aclose`
         """
-        if self._aclose is not None or self._open:
+        if self._aclose is not None or self._open or self._open_reads:
             raise RuntimeError("an async body cannot be closed synchronously; use aclose()")
         self._closed = True
 
@@ -1149,13 +1326,17 @@ class AsyncIterableBody:
             # IterableBody.close()
             source: object = self._aiterable
             if inspect.isasyncgen(source):
+                # as in IterableBody: a reader — waiting between two
+                # chunks, or in the generator in another task — must not
+                # take the end it sees for the end of the body
+                cut = self._cuts_a_read(source.ag_frame)
                 if not source.ag_running:
-                    # as in IterableBody.close(): a reader waiting
-                    # between two chunks must not take this for the end
-                    self._cut = self._cut or self._reading
+                    self._cut = self._cut or cut
                     await source.aclose()
                     self._open = False
-                elif not self._has_callback:
+                elif self._has_callback:
+                    self._cut = self._cut or cut
+                else:
                     raise RuntimeError(
                         "the body is being read by another task and has no aclose "
                         "callback: closing it would release nothing; cancel the reader"
@@ -1479,10 +1660,33 @@ class SpooledBody:
         :raises ValueError: if the body is closed
         """
         with self._lock:
-            file = self._file
-            if file.tell() != offset:
-                file.seek(offset)
-            return file.read(size)
+            return self._read_locked(offset, size)
+
+    def _read_locked(self, offset: int, size: int) -> bytes:
+        """
+        The read behind :py:meth:`_read_at` and :py:meth:`_read_inline`,
+        for a caller holding the lock.
+
+        The body ends where the last complete write ended, not where the
+        file does: a write that failed midway (a full disk) may have left
+        a part of its data behind, which is not part of the body.
+
+        :param offset: where to read
+        :param size: the number of bytes to read at most, ``-1`` for all
+                     up to the end
+        :return: the bytes read, empty at (or beyond) the end
+        :raises ValueError: if the body is closed
+        """
+        file = self._file
+        if file.closed:
+            raise ValueError("I/O operation on closed file")
+        left = max(self._size - offset, 0)
+        size = left if size < 0 else min(size, left)
+        if not size:
+            return b""
+        if file.tell() != offset:
+            file.seek(offset)
+        return file.read(size)
 
     def _read_inline(self, offset: int, size: int) -> Union[bytes, None]:
         """
@@ -1500,12 +1704,9 @@ class SpooledBody:
         if not self._lock.acquire(blocking=False):
             return None
         try:
-            file = self._file
-            if file.rolled:
+            if self._file.rolled:
                 return None
-            if file.tell() != offset:
-                file.seek(offset)
-            return file.read(size)
+            return self._read_locked(offset, size)
         finally:
             self._lock.release()
 
@@ -1700,7 +1901,9 @@ def save_body(
     :raises BlockingIOError: if the target is a raw file in non-blocking
                              mode that takes no more data
     """
-    chunks: Iterator[bytes] = iter((body,) if isinstance(body, bytes) else body.chunks())
+    chunks: Iterator[bytes] = iter(
+        (body,) if isinstance(body, bytes) else _producer(body).chunks()
+    )
     try:
         if not isinstance(target, (str, os.PathLike)):
             return _write_chunks(target, chunks)
@@ -1775,7 +1978,7 @@ def _achunks(body: Union[bytes, BodyProducer]) -> AsyncIterator[bytes]:
     """
     if isinstance(body, bytes):
         return _one_chunk(body)
-    return aiter(body.achunks())
+    return aiter(_producer(body).achunks())
 
 
 async def _one_chunk(data: bytes) -> AsyncIterator[bytes]:
@@ -1920,11 +2123,31 @@ def _charset(headers: Headers) -> str:
     :return: the charset, ``"utf-8"`` if there is none
     """
     content_type = headers.get(Header.CONTENT_TYPE, "")
-    for parameter in content_type.split(";")[1:]:
+    # a ";" inside a quoted value (boundary="a;charset=x") starts no
+    # parameter
+    for parameter in list(_split_elements(content_type, ";"))[1:]:
         name, sep, value = parameter.partition("=")
         if sep and name.strip().lower() == "charset":
             return value.strip().strip('"') or "utf-8"
     return "utf-8"
+
+
+def _producer(body: BodyProducer) -> BodyProducer:
+    """
+    The body that is neither bytes nor a str, to be read as a producer.
+
+    :param body: the body as set
+    :return: the same
+    :raises TypeError: for a ``bytearray`` or a ``memoryview``: bytes
+                       alright, but not what a body is set as — said
+                       here instead of by a missing method somewhere
+    """
+    if isinstance(body, (bytearray, memoryview)):
+        raise TypeError(
+            f"a body must be bytes, a str or a BodyProducer, got a {type(body).__name__}: "
+            "convert it with bytes()"
+        )
+    return body
 
 
 def _body_bytes(body: Union[BodyTypes, None], charset: str) -> Union[bytes, None]:
@@ -1934,6 +2157,7 @@ def _body_bytes(body: Union[BodyTypes, None], charset: str) -> Union[bytes, None
     :param body: the body as set
     :param charset: the charset for encoding a str body
     :return: the body bytes, ``None`` if there is no body
+    :raises TypeError: for a ``bytearray`` or ``memoryview`` body
     """
     if body is None:
         return None
@@ -1941,7 +2165,7 @@ def _body_bytes(body: Union[BodyTypes, None], charset: str) -> Union[bytes, None
         return body
     if isinstance(body, str):
         return body.encode(charset)
-    return body.as_bytes()
+    return _producer(body).as_bytes()
 
 
 def _body_str(body: Union[BodyTypes, None], charset: str) -> Union[str, None]:
@@ -1951,6 +2175,7 @@ def _body_str(body: Union[BodyTypes, None], charset: str) -> Union[str, None]:
     :param body: the body as set
     :param charset: the charset for decoding a bytes (or produced) body
     :return: the body text, ``None`` if there is no body
+    :raises TypeError: for a ``bytearray`` or ``memoryview`` body
     """
     if body is None:
         return None
@@ -1958,7 +2183,7 @@ def _body_str(body: Union[BodyTypes, None], charset: str) -> Union[str, None]:
         return body
     if isinstance(body, bytes):
         return body.decode(charset)
-    return body.as_bytes().decode(charset)
+    return _producer(body).as_bytes().decode(charset)
 
 
 def _body_producer(body: Union[BodyTypes, None], charset: str) -> Union[BodyProducer, None]:
@@ -1968,6 +2193,7 @@ def _body_producer(body: Union[BodyTypes, None], charset: str) -> Union[BodyProd
     :param body: the body as set
     :param charset: the charset for encoding a str body
     :return: the body producer, ``None`` if there is no body
+    :raises TypeError: for a ``bytearray`` or ``memoryview`` body
     """
     if body is None:
         return None
@@ -1975,7 +2201,7 @@ def _body_producer(body: Union[BodyTypes, None], charset: str) -> Union[BodyProd
         return BytesBody(body)
     if isinstance(body, str):
         return BytesBody(body.encode(charset))
-    return body
+    return _producer(body)
 
 
 def _rendered_body(body: BodyTypes, charset: str) -> str:
@@ -1984,23 +2210,30 @@ def _rendered_body(body: BodyTypes, charset: str) -> str:
     NOT consumed (it may be consumable only once) but shown as a
     placeholder.
 
-    A rendering shows what is there, it does not fail: bytes that are not
-    text in the charset (a compressed body, an image) come out with
-    U+FFFD replacement characters, and a charset Python does not know is
-    read as utf-8.
+    A rendering shows what is there, it does not fail over what the body
+    or the charset say: bytes that are not text in the charset (a
+    compressed body, an image) come out with U+FFFD replacement
+    characters, and a charset Python cannot decode with is read as
+    utf-8.
 
     :param body: the body as set
     :param charset: the charset for decoding a bytes body
     :return: the body text or a ``"<ClassName>"`` placeholder
+    :raises TypeError: for a ``bytearray`` or ``memoryview`` body
     """
     if isinstance(body, str):
         return body
     if isinstance(body, bytes):
         try:
             return body.decode(charset, errors="replace")
-        except LookupError:
+        except (LookupError, ValueError):
+            # the header is the sender's to write. LookupError: no such
+            # charset, or a codec that is not for text ("hex"). The
+            # ValueErrors: a codec that refuses to decode ("undefined")
+            # or to replace ("idna") — both UnicodeError —, a NUL in the
+            # name
             return body.decode("utf-8", errors="replace")
-    return f"<{type(body).__name__}>"
+    return f"<{type(_producer(body)).__name__}>"
 
 
 async def _read_all(body: BodyProducer) -> bytes:
@@ -2032,7 +2265,7 @@ async def _abody_bytes(body: Union[BodyTypes, None], charset: str) -> Union[byte
     """
     if body is None or isinstance(body, (bytes, str)):
         return _body_bytes(body, charset)
-    return await _read_all(body)
+    return await _read_all(_producer(body))
 
 
 async def _abody_str(body: Union[BodyTypes, None], charset: str) -> Union[str, None]:
@@ -2046,7 +2279,7 @@ async def _abody_str(body: Union[BodyTypes, None], charset: str) -> Union[str, N
     """
     if body is None or isinstance(body, (bytes, str)):
         return _body_str(body, charset)
-    return (await _read_all(body)).decode(charset)
+    return (await _read_all(_producer(body))).decode(charset)
 
 
 # closing — also shared by Request and Response. close() and aclose() are

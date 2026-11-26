@@ -65,7 +65,10 @@ print(Headers({"Authorization": "Bearer tok"}))  # Headers(Authorization: ***)
 ```
 
 A name or value containing a line break is refused with a `ValueError`,
-so a value from user input cannot smuggle in a header of its own.
+so a value from user input cannot smuggle in a header of its own — and
+so is a name that is empty or contains whitespace or a colon. Names are
+matched by their ASCII letters only, as on the wire: a lookalike such as
+`Hoſt` is not the `Host` header.
 
 `Request` combines a method, a `Url` (from action0-url), `Headers`, a
 `meta` dict for application metadata (never on the wire) and a body
@@ -102,7 +105,15 @@ print(Request("https://example.com", "OPTIONS", target="*").as_str(separator="\n
 # and from_str() parses what as_str() renders
 parsed = Request.from_str("GET /items?page=2 HTTP/1.1\nHost: api.example.com", scheme="https")
 print(parsed.url)  # https://api.example.com/items?page=2
+
+# a string or a mapping assigned to url/headers is converted
+parsed.headers = {"accept": "application/json"}
+print(parsed.headers["Accept"])  # application/json
 ```
+
+A method, target or HTTP version that would not stay one word of the
+request line, and a `Host` header that is more than a host and a port,
+are refused with a `ValueError`.
 
 `Response` mirrors it for the server side — status (with reason phrase
 fallback and category properties), headers, body:

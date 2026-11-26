@@ -1234,9 +1234,11 @@ class InThreadTestCase(unittest.TestCase):
         seen: list[bool] = []
         run_sync = trio.to_thread.run_sync
 
-        async def old_run_sync(function: Callable[[], Any], *, cancellable: bool = False) -> Any:
+        async def old_run_sync(
+            function: Callable[[], Any], *, cancellable: bool = False, limiter: Any = None
+        ) -> Any:
             seen.append(cancellable)
-            return await run_sync(function, abandon_on_cancel=cancellable)
+            return await run_sync(function, abandon_on_cancel=cancellable, limiter=limiter)
 
         async def main() -> int:
             return await body_module._in_thread_abandonable(int, "7", base=8)
@@ -2281,7 +2283,7 @@ class ThreadedIterableBodyTestCase(unittest.IsolatedAsyncioTestCase):
             chunks = [chunk async for chunk in body.achunks()]
         self.assertEqual(chunks, [b"a", b"b"])
         self.assertNotIn(threading.get_ident(), threads)
-        self.assertEqual(hops, ["_next_chunk"] * 3 + ["_close_after_threaded_read"])
+        self.assertEqual(hops, ["_next_chunk"] * 3 + ["_close_after_read"])
         self.assertEqual(len(released), 1)
         self.assertNotEqual(released[0], threading.get_ident())
 
@@ -2853,3 +2855,666 @@ class AsyncReadHelpersTestCase(unittest.IsolatedAsyncioTestCase):
                 return _Chunks()
 
         self.assertEqual(await body_module._read_all(cast("BodyProducer", _Producer())), b"ab")
+
+
+class DaemonThreadContextTestCase(unittest.IsolatedAsyncioTestCase):
+    """
+    tests for the context variables of a call that
+    :py:func:`action0.req.body._in_thread_abandonable` runs in one of
+    its reused daemon threads
+    """
+
+    async def test_call_sees_the_context_of_the_caller(self) -> None:
+        """
+        Test that a blocking iterable read with ``threaded=True`` sees
+        the context variables of the task reading it, as it does when
+        read on the event loop.
+        """
+        variable: contextvars.ContextVar[str] = contextvars.ContextVar("variable", default="unset")
+        variable.set("request-1")
+
+        def source() -> Iterator[bytes]:
+            yield variable.get().encode()
+
+        for threaded in (False, True):
+            with self.subTest(threaded=threaded):
+                body = IterableBody(source(), threaded=threaded)
+                self.assertEqual([chunk async for chunk in body.achunks()], [b"request-1"])
+
+    async def test_what_a_call_sets_does_not_leak(self) -> None:
+        """
+        Test that a context variable set inside a call stays there: the
+        next call — served by the same thread — and the calling task do
+        not see it.
+        """
+        variable: contextvars.ContextVar[str] = contextvars.ContextVar("variable", default="unset")
+
+        def leaking() -> tuple[int, str]:
+            variable.set("leaked")
+            return threading.get_ident(), variable.get()
+
+        def looking() -> tuple[int, str]:
+            return threading.get_ident(), variable.get()
+
+        first_thread, inside = await body_module._in_thread_abandonable(leaking)
+        second_thread, seen = await body_module._in_thread_abandonable(looking)
+        self.assertEqual(inside, "leaked")
+        # the same thread has served both, or the test shows nothing
+        self.assertEqual(first_thread, second_thread)
+        self.assertEqual(seen, "unset")
+        self.assertEqual(variable.get(), "unset")
+
+    async def test_non_seekable_file_is_read_in_the_callers_context(self) -> None:
+        """
+        Test the other user of these threads: a FileBody over a file
+        object that is not seekable.
+        """
+        variable: contextvars.ContextVar[str] = contextvars.ContextVar("variable", default="unset")
+        variable.set("request-2")
+
+        class _Pipe:
+            def __init__(self) -> None:
+                self._left = True
+
+            def seekable(self) -> bool:
+                return False
+
+            def read(self, size: int = -1) -> bytes:
+                if not self._left:
+                    return b""
+                self._left = False
+                return variable.get().encode()
+
+        body = FileBody(cast("IO[bytes]", _Pipe()))
+        self.assertEqual([chunk async for chunk in body.achunks()], [b"request-2"])
+
+
+class TrioAbandonedThreadsTestCase(unittest.TestCase):
+    """
+    tests for the calls that are left behind on trio: they must not use
+    up trio's thread limiter
+    """
+
+    def test_abandoned_calls_do_not_block_trios_thread_pool(self) -> None:
+        """
+        Test that a read which was timed out and is still stuck in its
+        thread does not keep a place in trio's default limiter: with
+        only one place there, another call still gets a thread.
+        """
+        stuck = threading.Event()
+        entered = threading.Event()
+
+        def stalling() -> None:
+            entered.set()
+            stuck.wait(10)
+
+        async def main() -> int:
+            limiter = trio.to_thread.current_default_thread_limiter()
+            limiter.total_tokens = 1
+            try:
+                with trio.move_on_after(0.05) as scope:
+                    await body_module._in_thread_abandonable(stalling)
+                self.assertTrue(scope.cancelled_caught)
+                self.assertTrue(entered.is_set())
+                self.assertEqual(limiter.borrowed_tokens, 0)
+                # the library's own cleanup, and anybody else's call
+                with trio.fail_after(5):
+                    await body_module._in_thread_shielded(int, "1")
+                    return await trio.to_thread.run_sync(int, "7")
+            finally:
+                stuck.set()
+
+        self.assertEqual(trio.run(main), 7)
+
+    def test_many_stalled_reads_at_once(self) -> None:
+        """
+        Test that more stalled reads than trio's limiter has places are
+        all under way at once — none of them waits for a place — and
+        that all of them can be timed out.
+        """
+        stuck = threading.Event()
+        entered: list[int] = []
+
+        def source() -> Iterator[bytes]:
+            entered.append(threading.get_ident())
+            stuck.wait(10)
+            yield b"late"
+
+        async def read() -> None:
+            async for _ in IterableBody(source(), threaded=True).achunks():
+                pass  # pragma: no cover
+
+        async def main() -> bool:
+            limiter = trio.to_thread.current_default_thread_limiter()
+            limiter.total_tokens = 2
+            try:
+                with trio.move_on_after(0.3) as scope:
+                    async with trio.open_nursery() as nursery:
+                        for _ in range(6):
+                            nursery.start_soon(read)
+                return scope.cancelled_caught
+            finally:
+                stuck.set()
+
+        self.assertTrue(trio.run(main))
+        self.assertEqual(len(set(entered)), 6)
+
+    def test_keyword_is_looked_up_once(self) -> None:
+        """
+        Test that the name of trio's keyword is not worked out anew for
+        every call — a threaded body makes one call per chunk.
+        """
+        body_module._abandon_keyword.cache_clear()
+
+        async def main() -> list[int]:
+            return [await body_module._in_thread_abandonable(int, str(n)) for n in range(4)]
+
+        self.assertEqual(trio.run(main), [0, 1, 2, 3])
+        info = body_module._abandon_keyword.cache_info()
+        self.assertEqual((info.misses, info.hits), (1, 3))
+        self.assertEqual(
+            body_module._abandon_keyword(trio.to_thread.run_sync), "abandon_on_cancel"
+        )
+
+
+class FileBodyViewsTestCase(unittest.TestCase):
+    """
+    tests for the files a path-based
+    :py:class:`action0.req.body.FileBody` opens for ``body_file()``
+    being tracked when several threads ask for one at once
+    """
+
+    def test_views_opened_concurrently_are_all_closed(self) -> None:
+        """
+        Test that no view gets lost when worker threads open them at the
+        same time — ``abody_file()`` of responses sharing a body does
+        that —, so close() closes every one.
+        """
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "data.bin"
+            path.write_bytes(b"data")
+            body = FileBody(path)
+            views: list[IO[bytes]] = []
+            barrier = threading.Barrier(8)
+
+            def open_views() -> None:
+                barrier.wait(10)
+                for _ in range(40):
+                    view = body._file_view()
+                    assert view is not None
+                    views.append(view)
+
+            interval = sys.getswitchinterval()
+            sys.setswitchinterval(1e-6)
+            try:
+                threads = [threading.Thread(target=open_views) for _ in range(8)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(10)
+            finally:
+                sys.setswitchinterval(interval)
+            self.assertEqual(len(views), 320)
+            self.assertEqual(len(body._views), 320)
+            body.close()
+            self.assertTrue(all(view.closed for view in views))
+
+    def test_body_with_a_path_can_be_pickled(self) -> None:
+        """
+        Test that keeping track of the views did not cost a path-based
+        body its picklability (the lock is not part of it).
+        """
+        import pickle
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "data.bin"
+            path.write_bytes(b"data")
+            restored = pickle.loads(pickle.dumps(FileBody(path)))
+            self.assertEqual(restored.as_bytes(), b"data")
+
+
+class SpooledBodyFailedWriteTestCase(unittest.TestCase):
+    """
+    tests for a :py:class:`action0.req.body.SpooledBody` whose write to
+    the temporary file failed midway: what that write left in the file
+    is not part of the body
+    """
+
+    def _body_with_a_failed_write(self) -> SpooledBody:
+        """
+        :return: a rolled-over body holding ``b"good"``, whose next write
+                 has put ``b"BAD"`` into the file before failing
+        """
+        body = SpooledBody(max_memory=0)
+        self.addCleanup(body.close)
+        body.write(b"good")
+        real_write = body._file.write
+
+        def partial_write(data: bytes) -> int:
+            real_write(data[:3])
+            raise OSError(28, "No space left on device")
+
+        with mock.patch.object(body._file, "write", partial_write):
+            with self.assertRaises(OSError):
+                body.write(b"BADDATA")
+        body._file.flush()
+        return body
+
+    def test_readers_end_where_the_body_ends(self) -> None:
+        """
+        Test that every way of reading the body ends at the last
+        complete write, in line with content_length().
+        """
+        body = self._body_with_a_failed_write()
+        self.assertEqual(body.content_length(), 4)
+        self.assertEqual(body.as_bytes(), b"good")
+        self.assertEqual(b"".join(body.chunks()), b"good")
+        self.assertEqual(_collect_achunks(body), [b"good"])
+        file = body.file()
+        self.assertEqual(file.read(), b"good")
+        self.assertEqual(file.seek(0, io.SEEK_END), 4)
+        file.seek(2)
+        self.assertEqual(file.read(100), b"od")
+        self.assertEqual(file.read(), b"")
+
+    def test_next_write_takes_the_place_of_the_remains(self) -> None:
+        """
+        Test that the body can be written on after the failure, and that
+        the data of the failed write does not show up in between.
+        """
+        body = self._body_with_a_failed_write()
+        body.write(b"!")
+        self.assertEqual(body.as_bytes(), b"good!")
+        self.assertEqual(body.file().read(), b"good!")
+        body.write(b" more than the remains")
+        self.assertEqual(body.as_bytes(), b"good! more than the remains")
+
+    def test_reads_in_memory_are_bounded_too(self) -> None:
+        """
+        Test the read on the event loop, which takes another path while
+        the data is in memory.
+        """
+        body = SpooledBody(max_memory=100, chunk_size=3)
+        self.addCleanup(body.close)
+        body.write(b"abcdefg")
+        self.assertEqual(_collect_achunks(body), [b"abc", b"def", b"g"])
+        self.assertEqual(body._read_inline(5, 10), b"fg")
+        self.assertEqual(body._read_inline(7, 10), b"")
+        self.assertEqual(body._read_at(9, -1), b"")
+
+    def test_closed_body_still_raises(self) -> None:
+        """
+        Test that reading a closed body raises also where there is
+        nothing to read.
+        """
+        body = SpooledBody()
+        body.close()
+        with self.assertRaises(ValueError):
+            body.as_bytes()
+        with self.assertRaises(ValueError):
+            list(body.chunks())
+        with self.assertRaises(ValueError):
+            _collect_achunks(body)
+
+
+class IterableBodyCutByCallbackTestCase(unittest.TestCase):
+    """
+    tests for :py:class:`action0.req.body.IterableBody` being closed
+    while another thread is inside its generator: the callback takes
+    away what the generator reads, and the end it then comes to is not
+    the end of the body
+    """
+
+    def test_stream_cut_by_the_callback_does_not_pass_for_complete(self) -> None:
+        """
+        Test that a reader gets an error instead of a short body when
+        the generator, robbed of its connection by close(), returns as
+        if at the end.
+        """
+        waiting = threading.Event()
+        connection_closed = threading.Event()
+
+        def source() -> Iterator[bytes]:
+            yield b"part1"
+            waiting.set()
+            # the "socket": reading it ends when it is closed
+            connection_closed.wait(10)
+
+        body = IterableBody(source(), close=connection_closed.set)
+        outcome: list[Any] = []
+
+        def read() -> None:
+            try:
+                outcome.append(body.as_bytes())
+            except RuntimeError as error:
+                outcome.append(error)
+
+        reader = threading.Thread(target=read)
+        reader.start()
+        self.assertTrue(waiting.wait(10))
+        body.close()
+        reader.join(10)
+        self.assertEqual(len(outcome), 1)
+        self.assertIsInstance(outcome[0], RuntimeError)
+        self.assertIn("closed while it was being read", str(outcome[0]))
+
+    def test_generator_closing_the_body_itself_is_a_regular_end(self) -> None:
+        """
+        Test that a generator which closes its body on the way out —
+        "release the connection once everything is read" — delivers a
+        complete body: that close() comes from inside the read.
+        """
+        released: list[bool] = []
+        bodies: list[IterableBody] = []
+
+        def source() -> Iterator[bytes]:
+            try:
+                yield b"a"
+                yield b"b"
+            finally:
+                bodies[0].close()
+
+        bodies.append(IterableBody(source(), close=lambda: released.append(True)))
+        self.assertEqual(bodies[0].as_bytes(), b"ab")
+        self.assertEqual(released, [True])
+
+    def test_refused_close_leaves_the_read_alone(self) -> None:
+        """
+        Test that a close() which raises because it could release
+        nothing — the generator is running, there is no callback — does
+        not mark the read as cut: it goes on and is complete.
+        """
+        waiting = threading.Event()
+        go_on = threading.Event()
+
+        def source() -> Iterator[bytes]:
+            yield b"a"
+            waiting.set()
+            go_on.wait(10)
+            yield b"b"
+
+        body = IterableBody(source())
+        outcome: list[Any] = []
+        reader = threading.Thread(target=lambda: outcome.append(body.as_bytes()))
+        reader.start()
+        self.assertTrue(waiting.wait(10))
+        with self.assertRaisesRegex(RuntimeError, "would release nothing"):
+            body.close()
+        go_on.set()
+        reader.join(10)
+        self.assertEqual(outcome, [b"ab"])
+
+
+class CloseGeneratorTestCase(unittest.TestCase):
+    """
+    tests for :py:func:`action0.req.body._close_generator`, which closes
+    a generator unless a thread is in it
+    """
+
+    class _Generator:
+        """
+        A stand-in whose state the test sets: whether it is running when
+        looked at, and after close() has been tried.
+        """
+
+        def __init__(self, running: list[bool], error: Union[BaseException, None]) -> None:
+            self._running = running
+            self._error = error
+            self.closed = False
+
+        @property
+        def gi_running(self) -> bool:
+            return self._running.pop(0)
+
+        def close(self) -> None:
+            if self._error is not None:
+                raise self._error
+            self.closed = True
+
+    def test_idle_generator_is_closed(self) -> None:
+        """
+        Test the regular case, with a real generator.
+        """
+
+        def source() -> Generator[bytes, None, None]:
+            yield b"a"
+
+        generator = source()
+        next(generator)
+        self.assertTrue(body_module._close_generator(generator))
+        with self.assertRaises(StopIteration):
+            next(generator)
+
+    def test_running_generator_is_left_alone(self) -> None:
+        """
+        Test that a generator that is running is not touched.
+        """
+        generator = self._Generator([True], None)
+        self.assertFalse(body_module._close_generator(generator))
+        self.assertFalse(generator.closed)
+
+    def test_thread_entering_between_check_and_close(self) -> None:
+        """
+        Test the race: the generator is idle when looked at, and a
+        worker thread that had been handed the next chunk is in it by
+        the time close() is called. That is "running", not an error.
+        """
+        generator = self._Generator([False, True], ValueError("generator already executing"))
+        self.assertFalse(body_module._close_generator(generator))
+
+    def test_error_of_the_generator_itself_passes(self) -> None:
+        """
+        Test that a ValueError raised by the cleanup of the generator is
+        not mistaken for that race, and that other errors pass as well.
+        """
+        generator = self._Generator([False, False], ValueError("from the finally block"))
+        with self.assertRaisesRegex(ValueError, "from the finally block"):
+            body_module._close_generator(generator)
+        generator = self._Generator([False], OSError("gone"))
+        with self.assertRaises(OSError):
+            body_module._close_generator(generator)
+
+    def test_cancelled_threaded_read_does_not_raise_over_the_race(self) -> None:
+        """
+        Test the place the race comes from: the end of a read with
+        ``threaded=True`` and no callback, where the generator is
+        entered by the thread left behind just as the body closes it.
+        The read ends without an error of its own.
+        """
+
+        def source() -> Iterator[bytes]:
+            yield b"a"  # pragma: no cover
+
+        body = IterableBody(source(), threaded=True)
+        with mock.patch.object(body_module, "_close_generator", return_value=False) as closing:
+            body._close_after_read(cast("Iterator[bytes]", body._iterable))
+        closing.assert_called_once()
+        with self.assertRaisesRegex(RuntimeError, "closed before it was read"):
+            body.as_bytes()
+
+
+class ReiterableSourceTestCase(unittest.IsolatedAsyncioTestCase):
+    """
+    tests for bodies over a source that can be iterated again and hands
+    out a new generator each time: the generator of a read that is given
+    up is closed with that read
+    """
+
+    async def test_async_generator_of_an_abandoned_read_is_closed(self) -> None:
+        """
+        Test that giving up a read of an AsyncIterableBody closes the
+        async generator the source made for it — its ``finally`` runs
+        then, not when the loop shuts down.
+        """
+        released: list[str] = []
+
+        class _Source:
+            async def __aiter__(self) -> AsyncIterator[bytes]:
+                try:
+                    yield b"a"
+                    yield b"b"
+                finally:
+                    released.append("connection")
+
+        body = AsyncIterableBody(_Source())
+        chunks = body.achunks()
+        self.assertEqual(await anext(chunks), b"a")
+        self.assertEqual(released, [])
+        await cast("AsyncGenerator[bytes, None]", chunks).aclose()
+        self.assertEqual(released, ["connection"])
+        # nothing is left open, and the source can be read again
+        body.close()
+        self.assertEqual([chunk async for chunk in body.achunks()], [b"a", b"b"])
+        self.assertEqual(released, ["connection", "connection"])
+
+    async def test_sync_close_refuses_while_such_a_read_is_open(self) -> None:
+        """
+        Test that the synchronous close() does not report "nothing to
+        release" while a read holds a started async generator.
+        """
+
+        class _Source:
+            async def __aiter__(self) -> AsyncIterator[bytes]:
+                yield b"a"
+                yield b"b"
+
+        body = AsyncIterableBody(_Source())
+        chunks = body.achunks()
+        await anext(chunks)
+        with self.assertRaisesRegex(RuntimeError, "use aclose"):
+            body.close()
+        await cast("AsyncGenerator[bytes, None]", chunks).aclose()
+        body.close()
+
+    async def test_failing_cleanup_still_runs_the_callback(self) -> None:
+        """
+        Test that an error from closing the read's generator does not
+        keep the body's ``aclose`` callback from running.
+        """
+        released: list[bool] = []
+
+        class _Source:
+            async def __aiter__(self) -> AsyncIterator[bytes]:
+                try:
+                    yield b"a"
+                finally:
+                    raise OSError("cleanup failed")
+
+        async def release() -> None:
+            released.append(True)
+
+        body = AsyncIterableBody(_Source(), aclose=release)
+        chunks = body.achunks()
+        await anext(chunks)
+        with self.assertRaises(OSError):
+            await cast("AsyncGenerator[bytes, None]", chunks).aclose()
+        self.assertEqual(released, [True])
+        self.assertEqual(body._open_reads, 0)
+
+    async def test_generator_of_an_abandoned_read_of_an_iterable_body(self) -> None:
+        """
+        Test the same for IterableBody.achunks(), on the event loop and
+        with ``threaded=True``: the generator of the read is closed with
+        it, not left to the garbage collector.
+        """
+        for threaded in (False, True):
+            with self.subTest(threaded=threaded):
+                released: list[str] = []
+                generators: list[Iterator[bytes]] = []
+
+                class _Source:
+                    def __iter__(self) -> Iterator[bytes]:
+                        generator = self._chunks()
+                        # a reference of the test's own: the garbage
+                        # collector has no part in this
+                        generators.append(generator)
+                        return generator
+
+                    def _chunks(self) -> Iterator[bytes]:
+                        try:
+                            yield b"a"
+                            yield b"b"
+                        finally:
+                            released.append("file")
+
+                body = IterableBody(_Source(), threaded=threaded)
+                chunks = body.achunks()
+                self.assertEqual(await anext(chunks), b"a")
+                await cast("AsyncGenerator[bytes, None]", chunks).aclose()
+                self.assertEqual(released, ["file"])
+                self.assertEqual([chunk async for chunk in body.achunks()], [b"a", b"b"])
+
+
+class AsyncIterableBodyCutByCallbackTestCase(unittest.IsolatedAsyncioTestCase):
+    """
+    tests for :py:class:`action0.req.body.AsyncIterableBody` being
+    closed while another task waits inside its generator
+    """
+
+    async def test_stream_cut_by_the_callback_does_not_pass_for_complete(self) -> None:
+        """
+        Test that a reader gets an error instead of a short body when
+        the generator, whose connection the ``aclose`` callback has
+        closed, returns as if at the end.
+        """
+        waiting = asyncio.Event()
+        connection_closed = asyncio.Event()
+
+        async def source() -> AsyncIterator[bytes]:
+            yield b"part1"
+            waiting.set()
+            # the "socket": reading it ends when it is closed
+            await connection_closed.wait()
+
+        async def close_connection() -> None:
+            connection_closed.set()
+
+        resp_body = AsyncIterableBody(source(), aclose=close_connection)
+        reader = asyncio.ensure_future(body_module._read_all(resp_body))
+        await waiting.wait()
+        await resp_body.aclose()
+        with self.assertRaisesRegex(RuntimeError, "closed while it was being read"):
+            await reader
+
+    async def test_generator_closing_the_body_itself_is_a_regular_end(self) -> None:
+        """
+        Test that an async generator which closes its body on the way
+        out delivers a complete body.
+        """
+        released: list[bool] = []
+        bodies: list[AsyncIterableBody] = []
+
+        async def source() -> AsyncIterator[bytes]:
+            try:
+                yield b"a"
+                yield b"b"
+            finally:
+                await bodies[0].aclose()
+
+        async def release() -> None:
+            released.append(True)
+
+        bodies.append(AsyncIterableBody(source(), aclose=release))
+        self.assertEqual(await body_module._read_all(bodies[0]), b"ab")
+        self.assertEqual(released, [True])
+
+    async def test_generator_closing_the_body_through_a_helper(self) -> None:
+        """
+        Test that the close is recognized as the generator's own also
+        when it is some calls away from the generator's code.
+        """
+        bodies: list[AsyncIterableBody] = []
+
+        async def release() -> None:
+            return None
+
+        async def finish() -> None:
+            await asyncio.sleep(0)
+            await bodies[0].aclose()
+
+        async def source() -> AsyncIterator[bytes]:
+            yield b"a"
+            await finish()
+
+        bodies.append(AsyncIterableBody(source(), aclose=release))
+        self.assertEqual(await body_module._read_all(bodies[0]), b"a")

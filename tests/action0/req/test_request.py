@@ -3,6 +3,7 @@ import pickle
 import unittest
 from collections.abc import AsyncIterator
 from typing import Any
+from typing import cast
 
 from action0.req import AsyncIterableBody
 from action0.req import BytesBody
@@ -824,8 +825,9 @@ class RequestReprSecretsTestCase(unittest.TestCase):
         """
         self.assertEqual(repr(Request("https://a/p")), "Request(GET https://a/p)")
         self.assertEqual(
-            repr(Request("https://a/p#token=1?x")), "Request(GET https://a/p#token=1?x)"
+            repr(Request("https://a/p#page=1?x")), "Request(GET https://a/p#page=1?x)"
         )
+        self.assertEqual(repr(Request("https://a/p#section")), "Request(GET https://a/p#section)")
         self.assertEqual(repr(Request("https://a/p?token")), "Request(GET https://a/p?token)")
 
     def test_secret_params_are_overridable(self) -> None:
@@ -1110,3 +1112,371 @@ class RequestAsyncBodyTestCase(unittest.IsolatedAsyncioTestCase):
         """
         self.assertEqual(await Request(body=BytesBody(b"abc")).abody_bytes(), b"abc")
         self.assertEqual(await Request(body=IterableBody([b"a", b"b"])).abody_str(), "ab")
+
+
+class RequestReprFragmentTestCase(unittest.TestCase):
+    """
+    tests for the redaction of secrets in the fragment of the URL by
+    :py:meth:`action0.req.request.Request.__repr__`
+    """
+
+    def test_tokens_in_the_fragment_are_redacted(self) -> None:
+        """
+        Test the shape the OAuth implicit flow returns its tokens in: a
+        fragment written like a query.
+        """
+        req = Request("https://app.example/cb#access_token=SECRET&token_type=bearer&id_token=X")
+        self.assertEqual(
+            repr(req),
+            "Request(GET https://app.example/cb#access_token=***&token_type=bearer&id_token=***)",
+        )
+
+    def test_query_of_a_client_side_route_is_redacted(self) -> None:
+        """
+        Test a fragment that is a route with a query of its own, next to
+        a query of the URL.
+        """
+        req = Request("https://app.example/?key=K&page=2#/callback?token=T&state=s")
+        self.assertEqual(
+            repr(req),
+            "Request(GET https://app.example/?key=***&page=2#/callback?token=***&state=s)",
+        )
+
+    def test_only_the_repr_redacts_the_fragment(self) -> None:
+        """
+        Test that the URL itself keeps the value.
+        """
+        req = Request("https://app.example/cb#access_token=SECRET")
+        self.assertEqual(req.url.as_str(), "https://app.example/cb#access_token=SECRET")
+
+    def test_instance_set_applies_to_the_fragment(self) -> None:
+        """
+        Test that the fragment is redacted by the request's own set of
+        names.
+        """
+        req = Request("https://a/p#session=abc&token=t")
+        req.secret_params = frozenset({"session"})
+        self.assertEqual(repr(req), "Request(GET https://a/p#session=***&token=t)")
+
+
+class RequestCopyInstanceAttributesTestCase(unittest.TestCase):
+    """
+    tests for :py:meth:`action0.req.request.Request.copy` taking along
+    what has been set on the instance
+    """
+
+    def test_copy_keeps_the_secret_params_of_the_instance(self) -> None:
+        """
+        Test that a copy redacts what the original redacts — a copy made
+        for a retry or a redirect must not log the secret in clear.
+        """
+        req = Request("https://h/?session=abc")
+        req.secret_params = req.secret_params | {"session"}
+        self.assertEqual(repr(req), "Request(GET https://h/?session=***)")
+        self.assertEqual(repr(req.copy()), "Request(GET https://h/?session=***)")
+        self.assertEqual(repr(req.copy(method="POST")), "Request(POST https://h/?session=***)")
+        self.assertEqual(repr(req.copy().copy()), "Request(GET https://h/?session=***)")
+
+    def test_class_default_is_untouched(self) -> None:
+        """
+        Test that a copy of a request without a set of its own has none
+        either, so a later change of the class attribute reaches it.
+        """
+        duplicate = Request("https://h/").copy()
+        self.assertNotIn("secret_params", vars(duplicate))
+        self.assertIs(duplicate.secret_params, Request.secret_params)
+
+    def test_other_instance_attributes_go_along(self) -> None:
+        """
+        Test that any attribute set on the instance is taken over
+        (shared, not copied), and that the parts of the request are
+        still the copy's own.
+        """
+        req = Request("https://h/a", headers={"A": "1"}, meta={"k": "v"})
+        marker = object()
+        req.__dict__["note"] = marker
+        duplicate = req.copy(method="PUT")
+        self.assertIs(duplicate.__dict__["note"], marker)
+        self.assertEqual(duplicate.method, "PUT")
+        self.assertIsNot(duplicate.url, req.url)
+        self.assertIsNot(duplicate.headers, req.headers)
+        self.assertIsNot(duplicate.meta, req.meta)
+        self.assertEqual(duplicate, req.copy(method="PUT"))
+
+
+class RequestStartLineSafetyTestCase(unittest.TestCase):
+    """
+    tests for :py:meth:`action0.req.request.Request.as_str` refusing a
+    method, target or version that would not stay one token of the
+    request line
+    """
+
+    def test_whitespace_in_the_method_is_refused(self) -> None:
+        """
+        Test that a method cannot carry a target and a version of its
+        own into the request line.
+        """
+        for method in ("GET /admin HTTP/1.1\tX", "GET /admin", "GET\t", "G\xa0ET", "G\x0bET"):
+            with self.subTest(method=method):
+                with self.assertRaisesRegex(ValueError, "method contains whitespace"):
+                    Request("https://h/p", method).as_str()
+
+    def test_whitespace_in_the_target_is_refused(self) -> None:
+        """
+        Test that an explicit target with a space — which would read as
+        a target and a version — raises.
+        """
+        for target in ("/a b", "/a b HTTP/1.0", "/a\tb", " /a", "/a "):
+            with self.subTest(target=target):
+                with self.assertRaisesRegex(ValueError, "request target contains whitespace"):
+                    Request("https://h/p", target=target).as_str()
+
+    def test_whitespace_in_the_version_is_refused(self) -> None:
+        """
+        Test the same for the HTTP version.
+        """
+        with self.assertRaisesRegex(ValueError, "HTTP version contains whitespace"):
+            Request("https://h/p", http_version="HTTP/1.1 X").as_str()
+
+    def test_empty_parts_are_refused(self) -> None:
+        """
+        Test that an empty method, target or version — which would leave
+        two parts on the line — raises.
+        """
+        with self.assertRaisesRegex(ValueError, "method must not be empty"):
+            Request("https://h/p", "").as_str()
+        with self.assertRaisesRegex(ValueError, "request target must not be empty"):
+            Request("https://h/p", target="").as_str()
+        with self.assertRaisesRegex(ValueError, "HTTP version must not be empty"):
+            Request("https://h/p", http_version="").as_str()
+
+    def test_what_is_rendered_can_be_parsed(self) -> None:
+        """
+        Test that the checks leave the regular request lines alone,
+        whatever their target form.
+        """
+        for req in (
+            Request("https://h/p?q=a%20b"),
+            Request("https://h", "OPTIONS", target="*"),
+            Request("//h:443", "CONNECT", target="h:443"),
+            Request("http://h/x", target="http://h/x", http_version="HTTP/1.0"),
+        ):
+            with self.subTest(req=req):
+                self.assertEqual(Request.from_str(req.as_str()).as_str(), req.as_str())
+
+
+class RequestAttributeSettersTestCase(unittest.TestCase):
+    """
+    tests for assigning to :py:attr:`action0.req.request.Request.url`
+    and :py:attr:`~action0.req.request.Request.headers`
+    """
+
+    def test_headers_mapping_is_converted(self) -> None:
+        """
+        Test that a dict assigned as the headers becomes a Headers
+        instance: lookups stay case-insensitive, the charset is found
+        and the rendering works.
+        """
+        req = Request("https://h/", "POST", body=b"\xe9")
+        req.headers = {"content-type": "text/plain; charset=latin-1"}
+        self.assertIsInstance(req.headers, Headers)
+        self.assertEqual(req.headers["Content-Type"], "text/plain; charset=latin-1")
+        self.assertEqual(req.body_str(), "é")
+        self.assertEqual(
+            req.as_str(), "POST / HTTP/1.1\r\nHost: h\r\ncontent-type: text/plain; charset=latin-1"
+        )
+
+    def test_other_header_forms_are_converted(self) -> None:
+        """
+        Test the forms the Headers constructor takes: a list of tuples,
+        a raw block, ``None``.
+        """
+        req = Request("https://h/")
+        req.headers = [("A", "1"), ("A", "2")]
+        self.assertEqual(req.headers.get_all("a"), ["1", "2"])
+        req.headers = "B: 3\r\nC: 4"
+        self.assertEqual(dict(req.headers), {"B": "3", "C": "4"})
+        req.headers = None
+        self.assertEqual(len(req.headers), 0)
+        self.assertIsInstance(req.headers, Headers)
+
+    def test_headers_instance_is_taken_as_it_is(self) -> None:
+        """
+        Test that assigning a Headers instance does not copy it (only
+        the constructor does), and keeps its class.
+        """
+
+        class Quiet(Headers):
+            pass
+
+        headers = Quiet({"A": "1"})
+        req = Request("https://h/")
+        req.headers = headers
+        self.assertIs(req.headers, headers)
+
+    def test_invalid_headers_are_refused(self) -> None:
+        """
+        Test that what cannot be headers raises on assignment, and
+        leaves the headers as they were.
+        """
+        req = Request("https://h/", headers={"A": "1"})
+        for value in (5, {"X": None}, {"X ": "1"}):
+            with self.subTest(value=value):
+                with self.assertRaises((TypeError, ValueError)):
+                    req.headers = cast("Any", value)
+        self.assertEqual(dict(req.headers), {"A": "1"})
+
+    def test_url_string_is_parsed(self) -> None:
+        """
+        Test that a string assigned as the URL becomes a Url.
+        """
+        req = Request("https://h/a")
+        req.url = "https://other.example/b?c=1"
+        self.assertIsInstance(req.url, Url)
+        self.assertEqual(req.as_str(), "GET /b?c=1 HTTP/1.1\r\nHost: other.example")
+
+    def test_url_instance_is_taken_as_it_is(self) -> None:
+        """
+        Test that assigning a Url does not copy it, and that ``None``
+        gives an empty URL as in the constructor.
+        """
+        url = Url("https://h/a")
+        req = Request()
+        req.url = url
+        self.assertIs(req.url, url)
+        req.url = None
+        self.assertEqual(req.url.as_str(), "")
+
+    def test_what_is_no_url_is_refused(self) -> None:
+        """
+        Test that anything else raises, and leaves the URL as it was.
+        """
+        req = Request("https://h/a")
+        for value in (5, b"https://h/", ["https://h/"]):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(TypeError, "the URL must be a Url or a str"):
+                    req.url = cast("Any", value)
+        self.assertEqual(req.url.as_str(), "https://h/a")
+
+    def test_pickle_keeps_the_attributes(self) -> None:
+        """
+        Test that a request survives pickling with its URL and headers
+        — they live in the instance dict under their public names, where
+        a pickle from before they were properties has them too.
+        """
+        req = Request("https://h/a?b=1", "POST", headers={"A": "1"}, body=b"x")
+        self.assertEqual(set(vars(req)) >= {"url", "headers", "method"}, True)
+        restored = pickle.loads(pickle.dumps(req))
+        self.assertEqual(restored, req)
+        self.assertEqual(restored.headers["a"], "1")
+        self.assertEqual(restored.url.as_str(), "https://h/a?b=1")
+
+
+class RequestFromStrHostTestCase(unittest.TestCase):
+    """
+    tests for what :py:meth:`action0.req.request.Request.from_str`
+    makes of the ``Host`` header
+    """
+
+    def test_host_with_more_than_a_host_is_refused(self) -> None:
+        """
+        Test that a Host value cannot become the path, the query, the
+        fragment or the userinfo of the URL.
+        """
+        for host in (
+            "e.com/evil?x",
+            "e.com?x",
+            "e.com#x",
+            "trusted.com@evil.com",
+            "user:pw@evil.com",
+            "e.com\\evil",
+            "a.com b.com",
+            "a.com\tb.com",
+        ):
+            with self.subTest(host=host):
+                with self.assertRaisesRegex(ValueError, "invalid Host header"):
+                    Request.from_str(f"GET /a HTTP/1.1\nHost: {host}\n\n", scheme="https")
+
+    def test_more_than_one_host_is_refused(self) -> None:
+        """
+        Test that two Host lines raise instead of the last one winning.
+        """
+        with self.assertRaisesRegex(ValueError, "more than one Host header"):
+            Request.from_str("GET /a HTTP/1.1\nHost: a.com\nhost: b.com\n\n")
+
+    def test_regular_hosts_are_taken(self) -> None:
+        """
+        Test the values a Host header does have: a name, with a port, an
+        IPv4 and an IPv6 address, and an empty one.
+        """
+        for host, expected in (
+            ("example.com", "//example.com/a"),
+            ("example.com:8443", "//example.com:8443/a"),
+            ("127.0.0.1:80", "//127.0.0.1:80/a"),
+            ("[::1]:8080", "//[::1]:8080/a"),
+            ("", "/a"),
+        ):
+            with self.subTest(host=host):
+                req = Request.from_str(f"GET /a HTTP/1.1\nHost: {host}\n\n")
+                self.assertEqual(req.url.as_str(), expected)
+                self.assertIsNone(req.target)
+
+    def test_lookalike_of_host_is_not_the_host(self) -> None:
+        """
+        Test that a field whose name merely casefolds to "host" neither
+        provides the host of the URL nor stands in for the Host header
+        when the request is rendered.
+        """
+        req = Request.from_str("GET /a HTTP/1.1\nHoſt: evil.com\n\n")
+        self.assertEqual(req.url.as_str(), "/a")
+        req = Request("https://example.com/", headers={"Hoſt": "evil"})
+        self.assertEqual(req.as_str(), "GET / HTTP/1.1\r\nHost: example.com\r\nHoſt: evil")
+
+    def test_what_a_request_always_is_differs_from_the_text(self) -> None:
+        """
+        Test the documented exceptions from the round trip: the method
+        comes back in uppercase, and a target naming the host comes with
+        the Host header derived from it.
+        """
+        self.assertEqual(Request.from_str("get /a HTTP/1.1").as_str(), "GET /a HTTP/1.1")
+        self.assertEqual(
+            Request.from_str("GET http://example.com/x HTTP/1.0").as_str(separator="\n"),
+            "GET http://example.com/x HTTP/1.0\nHost: example.com",
+        )
+        self.assertEqual(
+            Request.from_str("CONNECT example.com:443 HTTP/1.1").as_str(separator="\n"),
+            "CONNECT example.com:443 HTTP/1.1\nHost: example.com:443",
+        )
+
+
+class RequestBodyTypeTestCase(unittest.TestCase):
+    """
+    tests for a body of a type that is bytes-like but not a body:
+    ``bytearray`` and ``memoryview``
+    """
+
+    def test_accessors_say_what_is_wrong(self) -> None:
+        """
+        Test that every accessor raises a TypeError naming the type,
+        instead of an AttributeError about a method the object lacks.
+        """
+        for body in (bytearray(b"x"), memoryview(b"x")):
+            req = Request("http://x/", "POST", body=cast("Any", body))
+            for access in (
+                req.body_bytes,
+                req.body_str,
+                req.body_producer,
+                lambda req=req: req.as_str(include_body=True),
+                lambda req=req: asyncio.run(req.abody_bytes()),
+                lambda req=req: asyncio.run(req.abody_str()),
+            ):
+                with self.subTest(body=type(body).__name__, access=access):
+                    with self.assertRaisesRegex(TypeError, "convert it with bytes"):
+                        access()
+
+    def test_rendering_without_the_body_works(self) -> None:
+        """
+        Test that the body is only looked at where it is asked for.
+        """
+        req = Request("http://x/", "POST", body=cast("Any", bytearray(b"x")))
+        self.assertEqual(req.as_str(), "POST / HTTP/1.1\r\nHost: x")

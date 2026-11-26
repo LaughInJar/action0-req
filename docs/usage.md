@@ -86,11 +86,21 @@ print(headers.as_str(separator="\n"))
 Names are never normalized beyond casing — an underscore does not match
 a dash (`headers["content_type"]` would *not* find `Content-Type`); use
 the {py:class}`~action0.req.headers.Header` constants instead of magic.
+And casing means the ASCII letters, as on the wire: a lookalike from
+outside ASCII is a field of its own, not the header it resembles.
+
+```python
+from action0.req import Headers
+
+headers = Headers([("Hoſt", "evil.example"), ("HOST", "example.com")])
+print(headers["host"], len(headers))
+# example.com 2
+```
 
 Headers can be created from (and merged with) a raw header block, a
-mapping, a list of name/value tuples or another instance; non-string
-values are coerced. `update()` replaces existing fields in place and
-appends new ones:
+mapping, a list of name/value tuples or another instance; numbers and
+bools are coerced to strings. `update()` replaces existing fields in
+place and appends new ones:
 
 ```python
 from action0.req import Headers
@@ -124,22 +134,41 @@ print(headers.get_values("Cache-Control"))
 A name or value that would break out of its line on the wire — one
 containing a carriage return, a line feed or a NUL — is refused with a
 `ValueError`, whichever way it comes in, so a value taken from user
-input cannot smuggle in a header of its own. A raw header block is
-split at `\r\n` and `\n` only, and a line with whitespace in its name
-(also right before the colon) is not a header line. Bytes are not header
-values and raise a `TypeError`:
+input cannot smuggle in a header of its own. So is a name that a
+recipient would not read as that name: an empty one, one with a colon,
+and one with whitespace — `"Transfer-Encoding "` would be written as
+`Transfer-Encoding : chunked`, the classic request smuggling line. A raw
+header block is split at `\r\n` and `\n` only, and a line with
+whitespace in its name (also right before the colon) is not a header
+line.
 
 ```python
 from action0.req import Headers
 
 headers = Headers()
-try:
-    headers.add("X-Trace", "abc\r\nSet-Cookie: admin=1")
-except ValueError as error:
-    print(type(error).__name__)
-    # ValueError
+for name, value in [("X-Trace", "abc\r\nSet-Cookie: admin=1"), ("Transfer-Encoding ", "chunked")]:
+    try:
+        headers.add(name, value)
+    except ValueError as error:
+        print(str(error).split(",")[0])
+# value of the header 'X-Trace' contains a carriage return
+# header name contains whitespace
 print(len(headers))
 # 0
+```
+
+A value is a `str`, an `int`, a `float` or a `bool`, on its own or in a
+list. Anything else raises a `TypeError` — bytes (decode them first),
+and `None`, which would otherwise be sent as the text `None`:
+
+```python
+from action0.req import Headers
+
+try:
+    Headers({"X-Trace": [None]})
+except TypeError as error:
+    print(error)
+    # a header value must be a str, int, float or bool, got NoneType
 ```
 
 Equality ignores the order of different fields and the casing of names,
@@ -165,7 +194,7 @@ print(headers.as_str(separator="\n"))
 ## Requests
 
 {py:class}`~action0.req.request.Request` represents an HTTP request:
-method, URL, headers, body and HTTP version — every part a plain mutable
+method, URL, headers, body and HTTP version — every part a mutable
 attribute (the URL a {py:class}`~action0.url.base.Url` from
 [action0-url](https://laughinjar.github.io/action0-url/), the headers a
 {py:class}`~action0.req.headers.Headers`). The URL can be passed as a
@@ -187,10 +216,39 @@ print(req.as_str(separator="\n"))
 # Accept: application/json
 ```
 
+The URL and the headers stay what they are when they are assigned: a
+string becomes a `Url`, a mapping (or any other form the `Headers`
+constructor takes) becomes `Headers`, so the lookups keep ignoring the
+casing. A `Url` or `Headers` instance is taken as it is — only the
+constructor copies:
+
+```python
+from action0.req import Request
+
+req = Request("https://api.example.com/items")
+req.url = "https://api.example.com/users?page=2"
+req.headers = {"accept": "application/json"}
+print(req.url.path, req.headers["Accept"])
+# /users application/json
+```
+
 `as_str()` renders the wire format: the request line with the origin-form
 target and the headers, deriving `Host` from the URL when none is set
 (like `Headers.as_str()` it does NOT redact secret values — `repr()`
-does).
+does). The method, the target and the HTTP version are the three parts
+of the request line, separated by single spaces: one that is empty or
+contains whitespace would not be read as that part, and raises a
+`ValueError`.
+
+```python
+from action0.req import Request
+
+try:
+    Request("https://api.example.com/items", target="/admin HTTP/1.0").as_str()
+except ValueError as error:
+    print(str(error).split(",")[0])
+    # request target contains whitespace
+```
 
 The URL is kept the way it is written — its percent escapes and the
 spelling of its query are neither decoded nor re-encoded — and the
@@ -261,6 +319,21 @@ print(clone.url)
 # https://user:secret@api.example.com/items?id=7&token=abc
 ```
 
+A fragment written like a query — the tokens the OAuth implicit flow
+puts behind the `#` — is redacted the same way. A `secret_params` set
+on one request is that request's own, and its copies keep it:
+
+```python
+from action0.req import Request
+
+print(Request("https://app.example.com/callback#access_token=s3cr3t&state=xyz"))
+# Request(GET https://app.example.com/callback#access_token=***&state=xyz)
+req = Request("https://api.example.com/items?session=abc")
+req.secret_params = req.secret_params | {"session"}
+print(req.copy(method="POST"))
+# Request(POST https://api.example.com/items?session=***)
+```
+
 `Request.from_str()` is the inverse of `as_str()`: it parses the request
 line, the header lines and — behind a blank line — the body, which is
 taken as text. The URL is put together from the target and the `Host`
@@ -280,6 +353,27 @@ print(req.headers["Accept"], req.body)
 # */* hello
 print(req.as_str(include_body=True, separator="\n") == text)
 # True
+```
+
+Two things come back as a request always has them here, whatever the
+text said: the method in uppercase, and — for a request without a
+`Host` header whose target names the host (an absolute URL, the
+`host:port` of a `CONNECT`) — the `Host` derived from it.
+
+The `Host` header has to be a host, optionally with a port. A value with
+more to it would turn into the path or the userinfo of the URL
+(`trusted.com@evil.com` names the host `evil.com`), and of two `Host`
+lines nobody can say which one counts — both raise a `ValueError`, as a
+server answers them with a 400:
+
+```python
+from action0.req import Request
+
+try:
+    Request.from_str("GET /items HTTP/1.1\nHost: trusted.com@evil.com")
+except ValueError as error:
+    print(str(error).split(",")[0])
+    # invalid Host header
 ```
 
 Both requests and responses carry a `meta` dict for application metadata
@@ -320,10 +414,15 @@ print(req.as_str(include_body=True, separator="\n"))
 ```
 
 `as_str(include_body=True)` is a rendering for people and never fails
-over the body: bytes that are not text in the charset (a compressed
-body, an image) show with U+FFFD replacement characters. The accessors
-are strict — `body_str()` raises a `UnicodeDecodeError` for such a body,
-and a `LookupError` for a charset Python does not know.
+over what the body or its charset say: bytes that are not text in the
+charset (a compressed body, an image) show with U+FFFD replacement
+characters, and a charset Python cannot decode with is read as utf-8.
+The accessors are strict — `body_str()` raises a `UnicodeDecodeError`
+for such a body, and a `LookupError` for a charset Python does not know.
+
+A `bytearray` or a `memoryview` is not one of the three forms: the
+accessors (and `as_str(include_body=True)`) raise a `TypeError` that
+says so — pass `bytes(...)`.
 
 A `BodyProducer` body is streamed in chunks — synchronously via
 `chunks()` or asynchronously via `achunks()`; `as_str(include_body=True)`
@@ -460,7 +559,8 @@ called: on the event loop. That is right for chunks that are there
 already, but an iterable that blocks while it produces a chunk — reading
 a socket or a file — stalls the loop for as long. Pass `threaded=True`
 for such a source; then every chunk is fetched in a worker thread (and
-the `close` callback runs there too):
+the `close` callback runs there too). The iterable sees the context
+variables of the task that reads it there as well:
 
 ```python
 import asyncio
@@ -520,9 +620,17 @@ aborted from outside. Without a callback there is nothing that could
 stop the read, and closing raises a `RuntimeError` instead of pretending
 — cancel the reading task.
 
-A reader that is between two chunks when the body is closed does not
-see a quiet end either: its read raises a `RuntimeError`, because what
-it has got may not be the whole body.
+A reader of a body that is closed under it does not see a quiet end
+either — whether it is between two chunks, or waiting in the generator
+when the callback takes its connection away and the generator returns
+as if it were done: its read raises a `RuntimeError`, because what it
+has got may not be the whole body. (A generator that closes its own body
+on the way out is the regular end, not that.)
+
+A source that can be iterated more than once and makes a new generator
+for every read — an object whose `__iter__` or `__aiter__` is a
+generator function — has the generator of a read closed with that read,
+also when the consumer gives up midway.
 
 A request can hold such a body as well — one that was built but never
 sent, say. {py:meth}`Request.close() <action0.req.request.Request.close>`
@@ -579,7 +687,9 @@ from a finished one.
 If the data cannot be moved to the temporary file — the disk is full —
 the write raises and the body is closed: there is no telling how much
 made it, and a closed body raises on every read instead of handing out
-a part.
+a part. A later write that fails leaves the body as it was before:
+whatever part of it reached the file is not handed out, the body ends
+where its last complete write ended.
 
 In asynchronous code use `awrite()`, `achunks()` and `aclose()` (or
 `async with`). While the data is in memory they run inline; once it is
@@ -610,7 +720,8 @@ print(asyncio.run(main()))
 ## Responses
 
 {py:class}`~action0.req.response.Response` mirrors `Request` for the
-server side: status, headers, body and HTTP version as plain attributes,
+server side: status, headers, body and HTTP version as attributes (a
+mapping assigned as the headers becomes `Headers`, as for a request),
 with the same three body accessors. The status takes any int —
 {py:class}`~action0.req.status.Status` members included — and the
 {py:attr}`~action0.req.response.Response.phrase` falls back to the
@@ -647,8 +758,10 @@ print(Response(599).is_server_error)
 # True
 ```
 
-The status has to be an int; anything else — the string `"404"`, say —
-raises a `TypeError` when it is set, not later in a comparison.
+The status has to be an int; anything else — the string `"404"`, say,
+or a `bool` — raises a `TypeError` when it is set, not later in a
+comparison. The HTTP version must be one word: `as_str()` raises a
+`ValueError` for one that is empty or contains whitespace.
 
 `Response.from_str()` parses the text of a response, as
 `Request.from_str()` does for a request. The phrase of the status line
@@ -664,6 +777,19 @@ print(resp.status, resp.reason, resp.headers["Content-Type"], resp.body)
 # 404 Not Found text/plain not here
 print(resp.as_str(include_body=True, separator="\n") == text)
 # True
+```
+
+A status line without a phrase is taken at its word: the reason is the
+empty string, and no phrase from the registry is put in its place. (The
+space behind the status code is always written, also where the text had
+none, and the status code as the number it is.)
+
+```python
+from action0.req import Response
+
+resp = Response.from_str("HTTP/1.1 200 \nETag: abc")
+print(repr(resp.reason), repr(resp.as_str(separator="\n")))
+# '' 'HTTP/1.1 200 \nETag: abc'
 ```
 
 A response can reference the request that produced it — metadata that is
