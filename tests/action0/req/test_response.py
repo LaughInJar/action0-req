@@ -403,34 +403,53 @@ class ResponseBodyFileTestCase(unittest.TestCase):
 
     def test_file_body_over_a_path_is_opened_not_copied(self) -> None:
         """
-        Test that the file behind a path-based FileBody is opened once
-        and handed out as it is: no spool, the same file (rewound) on
-        every call, the response still readable, and close() closing the
-        file.
+        Test that the file behind a path-based FileBody is handed out as
+        it is: no spool, the body not replaced, a newly opened file with
+        a position of its own per call, and close() closing those still
+        open.
         """
         with TemporaryDirectory() as directory:
             path = Path(directory) / "cached.bin"
             path.write_bytes(b"abcdef")
-            resp = Response(200, body=FileBody(path, chunk_size=4))
+            body = FileBody(path, chunk_size=4)
+            resp = Response(200, body=body)
 
-            body = resp.body
             file = resp.body_file()
             assert file is not None
-            self.assertEqual(file.read(), b"abcdef")
-            # the body is not replaced, it keeps the file it has opened
-            self.assertIs(resp.body, body)
             self.assertEqual(Path(file.name), path)
+            self.assertEqual(file.read(4), b"abcd")
+            self.assertIs(resp.body, body)
 
-            self.assertIs(resp.body_file(), file)
-            self.assertEqual(file.tell(), 0)
-            producer = resp.body_producer()
-            assert producer is not None
-            self.assertEqual(list(producer.chunks()), [b"abcd", b"ef"])
-            self.assertEqual(producer.content_length(), 6)
+            other = resp.body_file()
+            assert other is not None
+            self.assertIsNot(other, file)
+            self.assertEqual(other.read(), b"abcdef")
+            self.assertEqual(file.read(), b"ef")
+            self.assertEqual(list(body.chunks()), [b"abcd", b"ef"])
 
+            other.close()
             resp.close()
             self.assertTrue(file.closed)
             resp.close()
+
+    def test_copies_get_files_of_their_own(self) -> None:
+        """
+        Test that responses sharing a path-based FileBody — copies, a
+        cached response served twice — do not share a file position.
+        """
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "cached.bin"
+            path.write_bytes(b"abcdef")
+            first = Response(200, body=FileBody(path))
+            second = first.copy()
+            with first, second:
+                one = first.body_file()
+                assert one is not None
+                self.assertEqual(one.read(4), b"abcd")
+                two = second.body_file()
+                assert two is not None
+                self.assertEqual(two.read(), b"abcdef")
+                self.assertEqual(one.read(), b"ef")
 
     def test_closing_the_file_of_a_path_body_does_no_harm(self) -> None:
         """
@@ -544,6 +563,26 @@ class ResponseBodyFileTestCase(unittest.TestCase):
                 assert file is not None
                 self.assertEqual(file.read(), b"ABCDEF")
                 self.assertEqual(resp.body_bytes(), b"ABCDEF")
+
+    def test_file_body_subclass_reading_as_usual_is_not_copied(self) -> None:
+        """
+        Test that a subclass of FileBody which does not change how the
+        file is read — it only adds something of its own — hands out its
+        file like the base class, without a copy.
+        """
+
+        class _Named(FileBody):
+            filename = "report.bin"
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "cached.bin"
+            path.write_bytes(b"abcdef")
+            body = _Named(path)
+            with Response(200, body=body) as resp:
+                file = resp.body_file()
+                assert file is not None
+                self.assertEqual(Path(file.name), path)
+                self.assertIs(resp.body, body)
 
     def test_replaced_producer_is_closed(self) -> None:
         """

@@ -3,9 +3,9 @@ import contextlib
 import gzip
 import io
 import json
+import os
 import sys
 import threading
-import time
 import unittest
 from collections.abc import AsyncGenerator
 from collections.abc import AsyncIterator
@@ -520,6 +520,25 @@ class IterableBodyCloseTestCase(unittest.TestCase):
         self.assertEqual(list(bodies[0].chunks()), [b"a", b"b"])
         self.assertEqual(released, [True])
 
+    def test_close_while_the_generator_is_running_without_callback(self) -> None:
+        """
+        Test that close() does not pretend to have closed a generator
+        that is executing right now when there is no callback either:
+        nothing was released, and it says so.
+        """
+        bodies: list[IterableBody] = []
+
+        def source() -> Iterator[bytes]:
+            yield b"a"
+            bodies[0].close()
+            yield b"b"  # pragma: no cover
+
+        bodies.append(IterableBody(source()))
+        chunks = bodies[0].chunks()
+        self.assertEqual(next(chunks), b"a")
+        with self.assertRaises(RuntimeError):
+            next(chunks)
+
 
 class AsyncIterableBodyCloseTestCase(unittest.IsolatedAsyncioTestCase):
     """
@@ -638,6 +657,39 @@ class AsyncIterableBodyCloseTestCase(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await reader
         self.assertEqual(self.closed, ["closed", "generator"])
+
+    async def test_aclose_while_another_task_reads_without_callback(self) -> None:
+        """
+        Test that aclose() does not pretend to have closed a body another
+        task is reading when there is no callback to stop that read:
+        nothing was released, and it says so. Cancelling the reader is
+        what ends it.
+        """
+        waiting = asyncio.Event()
+
+        async def source() -> AsyncIterator[bytes]:
+            try:
+                yield b"a"
+                waiting.set()
+                await asyncio.sleep(3600)
+            finally:
+                self.closed.append("generator")
+
+        body = AsyncIterableBody(source())
+
+        async def read() -> list[bytes]:
+            return [chunk async for chunk in body.achunks()]
+
+        reader = asyncio.ensure_future(read())
+        await waiting.wait()
+        with self.assertRaises(RuntimeError):
+            await body.aclose()
+        self.assertEqual(self.closed, [])
+        reader.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await reader
+        self.assertEqual(self.closed, ["generator"])
+        await body.aclose()
 
     async def test_sync_close_of_a_generator_read_in_part(self) -> None:
         """
@@ -1012,6 +1064,28 @@ class SpooledBodyAsyncTestCase(unittest.IsolatedAsyncioTestCase):
             await body.awrite(b"abc")
         self.assertTrue(body.closed)
 
+    async def test_inline_read_does_not_wait(self) -> None:
+        """
+        Test that a read on the event loop gives way instead of blocking
+        it: while a worker thread holds the lock (a write moving the data
+        to the file), and once the data is in the file.
+        """
+        async with SpooledBody(max_memory=8, chunk_size=4) as body:
+            await body.awrite(b"abcdef")
+            self.assertEqual(body._read_inline(2, 4), b"cdef")
+            body._lock.acquire()
+            try:
+                self.assertIsNone(body._read_inline(0, 4))
+            finally:
+                body._lock.release()
+            await body.awrite(b"ghi")  # exceeds max_memory
+            self.assertTrue(body.rolled)
+            self.assertIsNone(body._read_inline(0, 4))
+            with _recorded_thread_hops() as hops:
+                chunks = [chunk async for chunk in body.achunks()]
+            self.assertEqual(chunks, [b"abcd", b"efgh", b"i"])
+            self.assertEqual(hops, ["_read_at"] * 4)
+
     async def test_concurrent_readers(self) -> None:
         """
         Test that tasks reading the same body at the same time — a cached
@@ -1047,7 +1121,16 @@ class OwnedFileTestCase(unittest.TestCase):
             path = Path(directory) / "data.bin"
             path.write_bytes(b"abc")
 
+            self.assertFalse(body_module._OwnedFile(path).may_stall())
             self.assertFalse(body_module._OwnedFile(path).release())
+
+            # an open arriving after the release — the thread was left
+            # behind before it got to it — does not open anything
+            late = body_module._OwnedFile(path)
+            late.release()
+            late.open()
+            self.assertEqual(late.read(2), b"")
+            self.assertFalse(late.release())
 
             owned = body_module._OwnedFile(path)
             owned.open()
@@ -1096,6 +1179,47 @@ class InThreadTestCase(unittest.TestCase):
         self.assertNotEqual(thread, threading.get_ident())
         self.assertEqual(result, 3)
 
+    def test_abandonable_call_gets_a_daemon_thread_on_asyncio(self) -> None:
+        """
+        Test that a call which may be left behind does not run in the
+        loop's thread pool — a thread stuck there is waited for when the
+        loop shuts down — but in a daemon thread of its own, and that
+        result and error pass through.
+        """
+
+        def work() -> tuple[bool, str]:
+            thread = threading.current_thread()
+            return thread.daemon, thread.name
+
+        async def main() -> tuple[bool, str]:
+            with self.assertRaises(ValueError):
+                await body_module._in_thread_abandonable(int, "x")
+            return await body_module._in_thread_abandonable(work)
+
+        daemon, name = asyncio.run(main())
+        self.assertTrue(daemon)
+        self.assertFalse(name.startswith("asyncio"), name)
+
+    def test_abandonable_call_on_an_older_trio(self) -> None:
+        """
+        Test that below a trio from before 0.23, whose ``run_sync`` knows
+        the keyword as ``cancellable``, the abandonable dispatch uses
+        that name instead of failing.
+        """
+        seen: list[bool] = []
+        run_sync = trio.to_thread.run_sync
+
+        async def old_run_sync(function: Callable[[], Any], *, cancellable: bool = False) -> Any:
+            seen.append(cancellable)
+            return await run_sync(function, abandon_on_cancel=cancellable)
+
+        async def main() -> int:
+            return await body_module._in_thread_abandonable(int, "7", base=8)
+
+        with mock.patch.object(trio.to_thread, "run_sync", old_run_sync):
+            self.assertEqual(trio.run(main), 7)
+        self.assertEqual(seen, [True])
+
     def test_outside_any_event_loop(self) -> None:
         """
         Test that without asyncio and without trio the "no running event
@@ -1103,7 +1227,11 @@ class InThreadTestCase(unittest.TestCase):
         """
         with mock.patch.dict(sys.modules):
             sys.modules.pop("trio", None)
-            for dispatch in (body_module._in_thread, body_module._in_thread_shielded):
+            for dispatch in (
+                body_module._in_thread,
+                body_module._in_thread_shielded,
+                body_module._in_thread_abandonable,
+            ):
                 coroutine = dispatch(int, "7")
                 with self.assertRaises(RuntimeError):
                     coroutine.send(None)
@@ -1294,12 +1422,12 @@ class TrioCancellationTestCase(unittest.TestCase):
 
         with _recorded_thread_hops() as hops:
             self.assertTrue(trio.run(main))
-        self.assertEqual(hops, ["open", "read", "close"])
+        self.assertEqual(hops, ["may_stall", "open", "read", "close"])
 
     def test_stalled_read_does_not_block_a_timeout(self) -> None:
         """
         Test that a read which does not return — a pipe nobody writes to
-        — is left behind when the deadline passes, instead of being
+        — is left behind when its scope is cancelled, instead of being
         waited for.
         """
         gate = _Gate()
@@ -1312,18 +1440,20 @@ class TrioCancellationTestCase(unittest.TestCase):
                 gate.wait()
                 return b""
 
-        async def main() -> bool:
-            with trio.move_on_after(0.05) as scope:
-                async for _chunk in FileBody(cast("IO[bytes]", _Stalled())).achunks():
-                    pass  # pragma: no cover
-            return scope.cancelled_caught
+        async def read() -> None:
+            async for _chunk in FileBody(cast("IO[bytes]", _Stalled())).achunks():
+                pass  # pragma: no cover
 
-        started = time.monotonic()
+        async def main() -> None:
+            # fails if the nursery had to wait for the held read
+            with trio.fail_after(5):
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(read)
+                    await trio.to_thread.run_sync(gate.started.wait, 10)
+                    nursery.cancel_scope.cancel()
+
         try:
-            self.assertTrue(trio.run(main))
-            self.assertTrue(gate.started.is_set())
-            # long before the held read would give up by itself
-            self.assertLess(time.monotonic() - started, 5)
+            trio.run(main)
         finally:
             gate.release.set()
 
@@ -1427,6 +1557,18 @@ class AsyncioCancellationTestCase(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(files[0].closed)
             self.assertEqual(self.path.read_bytes(), b"abc")
 
+    async def _assert_cancelled_at_once(self, task: "asyncio.Future[Any]") -> None:
+        """
+        Cancel a task whose worker thread is held, and check that the
+        cancellation gets through without waiting for the thread.
+        """
+        task.cancel()
+        # wait() instead of wait_for(): it never waits for the task
+        # beyond the timeout, whatever the task does with its cancellation
+        done, _pending = await asyncio.wait({task}, timeout=5)
+        self.assertEqual(done, {task})
+        self.assertTrue(task.cancelled())
+
     async def test_stalled_read_does_not_block_a_timeout(self) -> None:
         """
         Test that a read which does not return — a pipe nobody writes to
@@ -1447,19 +1589,16 @@ class AsyncioCancellationTestCase(unittest.IsolatedAsyncioTestCase):
             body = FileBody(cast("IO[bytes]", _Stalled()))
             return [chunk async for chunk in body.achunks()]
 
-        started = time.monotonic()
+        task = asyncio.ensure_future(read())
         try:
-            with self.assertRaises(asyncio.TimeoutError):
-                await asyncio.wait_for(read(), 0.05)
-            self.assertTrue(gate.started.is_set())
-            # long before the held read would give up by itself
-            self.assertLess(time.monotonic() - started, 5)
+            await asyncio.to_thread(gate.started.wait, 10)
+            await self._assert_cancelled_at_once(task)
         finally:
             gate.release.set()
 
     async def test_abandoned_read_closes_the_file(self) -> None:
         """
-        Test that the file a path-based FileBody has opened is closed
+        Test that the file opened for a path that may stall is closed
         although its consumer was cancelled during a read: not by the
         consumer, which does not wait, but by the read left behind — as
         soon as it returns.
@@ -1480,11 +1619,12 @@ class AsyncioCancellationTestCase(unittest.IsolatedAsyncioTestCase):
             return [chunk async for chunk in FileBody(self.path).achunks()]
 
         self.path.write_bytes(b"abcdef")
+        stalling = mock.patch.object(body_module._OwnedFile, "may_stall", return_value=True)
         try:
-            with mock.patch.object(body_module, "_open_binary", open_held):
-                with self.assertRaises(asyncio.TimeoutError):
-                    await asyncio.wait_for(read(), 0.05)
-            self.assertTrue(gate.started.is_set())
+            with stalling, mock.patch.object(body_module, "_open_binary", open_held):
+                task = asyncio.ensure_future(read())
+                await asyncio.to_thread(gate.started.wait, 10)
+                await self._assert_cancelled_at_once(task)
             self.assertFalse(files[0].closed)
         finally:
             gate.release.set()
@@ -1493,6 +1633,56 @@ class AsyncioCancellationTestCase(unittest.IsolatedAsyncioTestCase):
                 break
             await asyncio.sleep(0.01)
         self.assertTrue(files[0].closed)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs named pipes")
+    async def test_named_pipe_without_a_writer_does_not_block_a_timeout(self) -> None:
+        """
+        Test that the path of a named pipe nobody writes to — where
+        already the opening blocks — does not hold up a cancellation.
+        """
+        fifo = self.path.with_name("pipe")
+        os.mkfifo(fifo)
+
+        async def read() -> list[bytes]:
+            return [chunk async for chunk in FileBody(fifo).achunks()]
+
+        task = asyncio.ensure_future(read())
+        try:
+            # time to get stuck in open(); the test holds without it too
+            await asyncio.sleep(0.1)
+            await self._assert_cancelled_at_once(task)
+        finally:
+            # a writer showing up for a moment lets the thread left
+            # behind in open() go
+            with contextlib.suppress(OSError):
+                os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+
+    async def test_read_of_a_seekable_file_is_not_left_behind(self) -> None:
+        """
+        Test that a read from a seekable file object is finished before
+        the cancellation is passed on: left behind, it would move the
+        position under whoever reads the body next — a retry would
+        silently lose data.
+        """
+        gate = _Gate()
+
+        class _Slow(io.BytesIO):
+            reads = 0
+
+            def read(self, size: Union[int, None] = -1, /) -> bytes:
+                self.reads += 1
+                if self.reads == 1:
+                    gate.wait()
+                return super().read(size)
+
+        body = FileBody(_Slow(b"AAAABBBBCCCCDDDD"), chunk_size=4)
+
+        async def read() -> bytes:
+            return b"".join([chunk async for chunk in body.achunks()])
+
+        task = asyncio.ensure_future(read())
+        await _cancel_while_held(self, task, gate)
+        self.assertEqual(await read(), b"AAAABBBBCCCCDDDD")
 
 
 class SaveBodyTestCase(unittest.TestCase):

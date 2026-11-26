@@ -278,9 +278,9 @@ iterable — e.g. an async generator proxying another stream. It is
 async-only: the synchronous `chunks()`/`as_bytes()` raise a
 `RuntimeError`. Every producer supports `achunks()` for asynchronous
 consumption (`FileBody` runs its file operations in a worker thread —
-`asyncio.to_thread`, or trio's thread pool below trio 0.23 or later — so
-the event loop is never blocked; a read that does not return, like one
-from a pipe nobody writes to, does not stand in the way of a timeout):
+`asyncio.to_thread`, or trio's thread pool below trio — so the event
+loop is never blocked; a source that may block for good, like a named
+pipe nobody writes to, does not stand in the way of a timeout):
 
 ```python
 import asyncio
@@ -334,7 +334,9 @@ over a generator cannot be read after it has been closed; one over a
 list is not affected. A generator that is running at that moment —
 another task is waiting in it for the next chunk — is left alone: the
 callback releases what it reads from, which is how a stalled read is
-aborted from outside.
+aborted from outside. Without a callback there is nothing that could
+stop the read, and closing raises a `RuntimeError` instead of pretending
+— cancel the reading task.
 
 ### Spooled bodies
 
@@ -377,6 +379,10 @@ therefore read the same body at once — two tasks serving one cached
 response, say — and closing a view, or handing it to a wrapper that
 closes what it wraps (`io.TextIOWrapper`), leaves the body alone. A view
 has no file descriptor; `save_body()` puts the data into a real file.
+
+Read a spooled body once it is complete: a reader ends where the data
+ends at that moment, and cannot tell a body that is still being written
+from a finished one.
 
 In asynchronous code use `awrite()`, `achunks()` and `aclose()` (or
 `async with`). While the data is in memory they run inline; once it is
@@ -463,10 +469,9 @@ a seekable binary file object — for consumers that read from a file,
 like streaming parsers or decompressors. For an in-memory body that is
 an in-memory file; a {py:class}`~action0.req.body.SpooledBody` hands out
 a read-only view of itself; a {py:class}`~action0.req.body.FileBody` hands out the
-file it wraps, or opens its path once — nothing is copied, the opened
-file is closed with the response, and closing it yourself does no harm
-(the next call opens it again); and a streamed body is read to its end
-into a new
+file it wraps, or opens its path anew for every call — nothing is
+copied, and what you have not closed yourself is closed with the
+response; and a streamed body is read to its end into a new
 `SpooledBody`, which then replaces `resp.body`, so the response stays
 readable. The stream it replaces has delivered everything and is closed,
 which releases its connection:
