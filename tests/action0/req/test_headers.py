@@ -2,9 +2,11 @@ import pickle
 import unittest
 from typing import Any
 from typing import cast
+from unittest import mock
 
 from action0.req import Header
 from action0.req import Headers
+from action0.req import headers as headers_module
 from action0.req.headers import HeaderValue
 
 
@@ -701,3 +703,290 @@ class HeadersEqRobustnessTestCase(unittest.TestCase):
             with self.subTest(other=other):
                 self.assertFalse(headers == other)
                 self.assertTrue(headers != other)
+
+
+class HeadersNameTestCase(unittest.TestCase):
+    """
+    tests for the field names :py:class:`action0.req.headers.Headers`
+    refuses, and for how it matches the ones it takes
+    """
+
+    def test_names_that_are_not_names_are_refused(self) -> None:
+        """
+        Test that a name which a recipient would not read as that name —
+        empty, with whitespace anywhere, with a colon — raises whichever
+        way it comes in, and that nothing is added.
+        """
+        headers = Headers({"Accept": "*/*"})
+        names = (
+            "",
+            " Transfer-Encoding",
+            "Transfer-Encoding ",
+            "Transfer-Encoding\t",
+            "X A",
+            "X\xa0A",
+            "X\x0bA",
+            "Foo: bar",
+            ":authority",
+        )
+        for name in names:
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    headers.add(name, "1")
+                with self.assertRaises(ValueError):
+                    headers.set(name, "1")
+                with self.assertRaises(ValueError):
+                    headers[name] = "1"
+                with self.assertRaises(ValueError):
+                    headers.update({name: "1"})
+                with self.assertRaises(ValueError):
+                    Headers({name: "1"})
+                with self.assertRaises(ValueError):
+                    Headers([(name, "1")])
+        self.assertEqual(headers.as_str(), "Accept: */*")
+
+    def test_error_says_what_is_wrong_with_the_name(self) -> None:
+        """
+        Test the three messages: empty, whitespace, colon.
+        """
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            Headers().add("", "1")
+        with self.assertRaisesRegex(ValueError, "whitespace.*'Content-Length '"):
+            Headers().add("Content-Length ", "0")
+        with self.assertRaisesRegex(ValueError, "a colon.*'Foo:bar'"):
+            Headers().add("Foo:bar", "x")
+
+    def test_whatever_is_taken_can_be_parsed_again(self) -> None:
+        """
+        Test that the rendering of headers built line by line is a raw
+        block the constructor accepts — the two ways in agree on what a
+        name is.
+        """
+        headers = Headers([("X-Odd_Name!", "1"), ("Bücher", "2"), ("x.y", "3")])
+        self.assertEqual(Headers(headers.as_str()).as_lines(), headers.as_lines())
+
+    def test_only_ascii_letters_are_matched_without_case(self) -> None:
+        """
+        Test that a lookalike from outside ASCII — "ſ" casefolds to "s",
+        the Kelvin sign to "k" — is a field of its own and not the
+        ``Host`` or ``Cookie`` header.
+        """
+        headers = Headers([("Hoſt", "evil.example"), ("Coo\u212aie", "x"), ("HOST", "a")])
+        self.assertEqual(headers["host"], "a")
+        self.assertEqual(headers.get_all(Header.HOST), ["a"])
+        self.assertIsNone(headers.get("cookie"))
+        self.assertNotIn(Header.COOKIE, headers)
+        self.assertEqual(len(headers), 3)
+        self.assertEqual(
+            headers.as_dict(), {"Hoſt": ["evil.example"], "Coo\u212aie": ["x"], "HOST": ["a"]}
+        )
+        # the ASCII letters of such a name still match without case
+        self.assertEqual(headers["hOſT"], "evil.example")
+        self.assertNotEqual(Headers({"Hoſt": "a"}), Headers({"Host": "a"}))
+        # removing or replacing the real field leaves the lookalike alone
+        headers["Host"] = "b"
+        self.assertEqual(headers.remove("host"), ["b"])
+        self.assertEqual(headers.as_lines(), [("Hoſt", "evil.example"), ("Coo\u212aie", "x")])
+
+    def test_lookalike_of_a_secret_name_is_not_redacted_as_one(self) -> None:
+        """
+        Test that the repr redacts by the same rule the lookups use.
+        """
+        headers = Headers([("Cookie", "a=1"), ("COOKIE", "b=2"), ("Coo\u212aie", "visible")])
+        self.assertEqual(repr(headers), "Headers(Cookie: ***, COOKIE: ***, Coo\u212aie: visible)")
+
+    def test_sort_ignores_ascii_case(self) -> None:
+        """
+        Test that sorting goes by the name as the lookups compare it.
+        """
+        headers = Headers([("b", "1"), ("A", "2"), ("a", "3")])
+        headers.sort()
+        self.assertEqual(headers.as_lines(), [("A", "2"), ("a", "3"), ("b", "1")])
+
+
+class HeadersValueTypesTestCase(unittest.TestCase):
+    """
+    tests for the values :py:class:`action0.req.headers.Headers` takes:
+    the same in a list as on their own
+    """
+
+    def test_none_in_a_list_is_refused(self) -> None:
+        """
+        Test that a ``None`` among the values raises instead of being
+        sent as the string "None" — as a ``None`` on its own does.
+        """
+        for values in ([None], ["a", None]):
+            with self.subTest(values=values):
+                with self.assertRaisesRegex(TypeError, "NoneType"):
+                    Headers(cast("Any", {"X-Trace": values}))
+                with self.assertRaises(TypeError):
+                    Headers().add("X-Trace", cast("Any", values))
+        with self.assertRaisesRegex(TypeError, "NoneType"):
+            Headers(cast("Any", {"X-Trace": None}))
+
+    def test_other_objects_are_refused(self) -> None:
+        """
+        Test that only what is declared a header value is taken: an
+        arbitrary object is not turned into its ``str()``.
+        """
+        for value in (object(), 1j):
+            with self.subTest(value=value):
+                with self.assertRaises(TypeError):
+                    Headers().add("X", cast("Any", [value]))
+                with self.assertRaises(TypeError):
+                    Headers().add("X", cast("Any", value))
+
+    def test_numbers_and_bools_in_a_list(self) -> None:
+        """
+        Test that the values that are coerced on their own are coerced
+        in a list as well.
+        """
+        values: list[HeaderValue] = [1, 2.5, True, "s"]
+        headers = Headers({"X": values})
+        self.assertEqual(headers.get_all("X"), ["1", "2.5", "true", "s"])
+
+    def test_bytes_error_says_what_to_do(self) -> None:
+        """
+        Test that the error for bytes still carries its hint.
+        """
+        with self.assertRaisesRegex(TypeError, "got bytes: decode it first"):
+            Headers(cast("Any", {"X": b"ab"}))
+
+    def test_what_is_no_headers_at_all_is_refused(self) -> None:
+        """
+        Test that the constructor does not take something it cannot read
+        for "no headers".
+        """
+        for headers in (5, 1.5, object()):
+            with self.subTest(headers=headers):
+                with self.assertRaisesRegex(TypeError, "headers must be"):
+                    Headers(cast("Any", headers))
+        self.assertEqual(len(Headers(None)), 0)
+
+
+class HeadersIndexTestCase(unittest.TestCase):
+    """
+    tests for the lookups of :py:class:`action0.req.headers.Headers`
+    staying right through every kind of change (they are answered from
+    an index that is built once and dropped on a change)
+    """
+
+    def test_lookups_follow_every_change(self) -> None:
+        """
+        Test the mapping view after each of the methods that change the
+        lines.
+        """
+        headers = Headers("A: 1\nB: 2")
+        self.assertEqual(dict(headers), {"A": "1", "B": "2"})
+        headers.add("a", "3")
+        self.assertEqual((headers["A"], headers.get_all("a"), len(headers)), ("3", ["1", "3"], 2))
+        headers.set("B", ["4", "5"])
+        self.assertEqual(headers.get_all("b"), ["4", "5"])
+        headers["C"] = "6"
+        self.assertIn("c", headers)
+        self.assertEqual(headers.remove("A", "1"), ["1"])
+        self.assertEqual(headers.get_all("A"), ["3"])
+        del headers["a"]
+        self.assertNotIn("A", headers)
+        headers.update({"b": "7", "D": "8"})
+        self.assertEqual(headers.as_dict(), {"b": ["7"], "C": ["6"], "D": ["8"]})
+        headers.sort()
+        self.assertEqual(list(headers), ["b", "C", "D"])
+        headers.clear()
+        self.assertEqual((len(headers), list(headers), "b" in headers), (0, [], False))
+
+    def test_results_are_the_callers_own(self) -> None:
+        """
+        Test that a list handed out is not the one the lookups are
+        answered from.
+        """
+        headers = Headers("A: 1")
+        headers.get_all("A").append("2")
+        headers.as_dict()["A"].append("3")
+        self.assertEqual(headers.get_all("a"), ["1"])
+        self.assertEqual(headers.as_dict(), {"A": ["1"]})
+
+    def test_copy_does_not_share_the_index(self) -> None:
+        """
+        Test that a copy taken after a lookup sees its own changes, and
+        the original does not.
+        """
+        headers = Headers("A: 1")
+        self.assertEqual(headers["a"], "1")
+        duplicate = headers.copy()
+        duplicate.add("A", "2")
+        duplicate.add("B", "3")
+        self.assertEqual(duplicate.get_all("a"), ["1", "2"])
+        self.assertIn("B", duplicate)
+        self.assertEqual(headers.get_all("a"), ["1"])
+        self.assertNotIn("B", headers)
+
+    def test_fields_may_change_while_iterating(self) -> None:
+        """
+        Test that iterating the names and removing fields along the way
+        works: the iteration is over the names as they were.
+        """
+        headers = Headers("A: 1\nB: 2\na: 3")
+        seen = []
+        for name in headers:
+            seen.append(name)
+            del headers[name]
+        self.assertEqual(seen, ["A", "B"])
+        self.assertEqual(len(headers), 0)
+
+    def test_instance_from_an_older_pickle(self) -> None:
+        """
+        Test that an instance whose state has nothing but the lines — as
+        pickled by a version without the index — works.
+        """
+        headers = Headers.__new__(Headers)
+        headers.__dict__.update({"_lines": [("A", "1"), ("a", "2")]})
+        self.assertEqual(headers["A"], "2")
+        headers.add("B", "3")
+        self.assertEqual(dict(headers), {"A": "2", "B": "3"})
+        restored = pickle.loads(pickle.dumps(headers))
+        self.assertEqual(restored, headers)
+        self.assertEqual(restored.get_all("a"), ["1", "2"])
+
+    def test_update_replaces_in_place_and_appends(self) -> None:
+        """
+        Test update() as a whole: the lines of a field that exists are
+        replaced at the position of its first line, in the spelling of
+        the new field's first line; new fields follow at the end, in
+        their order.
+        """
+        headers = Headers([("A", "1"), ("B", "2"), ("a", "3"), ("C", "4")])
+        headers.update([("c", "5"), ("New", "6"), ("A", "7"), ("a", "8"), ("Other", "9")])
+        self.assertEqual(
+            headers.as_lines(),
+            [("A", "7"), ("A", "8"), ("B", "2"), ("c", "5"), ("New", "6"), ("Other", "9")],
+        )
+
+    def test_update_with_itself(self) -> None:
+        """
+        Test that updating headers with themselves keeps every value.
+        """
+        headers = Headers([("A", "1"), ("B", "2"), ("a", "3")])
+        headers.update(headers)
+        self.assertEqual(headers.as_lines(), [("A", "1"), ("A", "3"), ("B", "2")])
+
+    def test_many_lines_are_handled_in_linear_time(self) -> None:
+        """
+        Test that the mapping view of a large number of fields does not
+        fold every name for every lookup: the names are folded once per
+        build of the index.
+        """
+        headers = Headers([(f"X-Field-{number}", "v") for number in range(300)])
+        calls = 0
+        real = headers_module._fold
+
+        def counting(name: str) -> str:
+            nonlocal calls
+            calls += 1
+            return real(name)
+
+        with mock.patch.object(headers_module, "_fold", counting):
+            self.assertEqual(len(dict(headers)), 300)
+            self.assertEqual(len(headers.items()), 300)
+        # 300 to build the index, 300 for the lookups of dict()
+        self.assertLessEqual(calls, 1000)

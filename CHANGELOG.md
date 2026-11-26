@@ -86,6 +86,61 @@ Behaviour that code may rely on:
   instance of their own class.
 - A `SpooledBody` whose data cannot be moved to the temporary file is
   closed (see Fixed).
+- **Header names are matched by their ASCII letters only**, as HTTP
+  matches them. They were compared with `str.casefold()`, which also
+  maps characters from outside ASCII onto ASCII letters: `Hoſt` (U+017F)
+  was the `Host` header and `Coo\u212Aie` (the Kelvin sign) the `Cookie`
+  header here, and for no other party. Such a name is a field of its own
+  now — in lookups, in equality, in `Request.from_str()` (which took the
+  host of the URL from it) and for the `Host` that `Request.as_str()`
+  derives.
+- **A header name must be a name**: an empty one, one with whitespace
+  (`"Transfer-Encoding "`, rendered as the request smuggling line
+  `Transfer-Encoding : chunked`) and one with a colon raise a
+  `ValueError` in `add()`, `set()`, `update()` and the constructor. The
+  parser of a raw header block refused them already.
+- **A header value in a list is held to the same types as one on its
+  own**: a `str`, an `int`, a `float` or a `bool`. Anything else raises
+  a `TypeError`; it was turned into its `str()`, which sent a `None` in
+  a list as the header value `None`. `Headers(5)` — something that is no
+  form of headers at all — raises a `TypeError` as well instead of
+  giving empty headers.
+- **`Request.as_str()` and `Response.as_str()` refuse a method, target
+  or HTTP version that is empty or contains whitespace** (`ValueError`):
+  the parts of a start line are separated by single spaces, and
+  `Request(url, target="/a b HTTP/1.0")` rendered a request line with a
+  target and a version of the caller's choosing.
+- **`Request.from_str()` refuses a `Host` header that is more than a
+  host and a port, and more than one `Host` line** (`ValueError`). The
+  value was put in front of the target unchecked, so `Host:
+  trusted.com@evil.com` gave a URL with the host `evil.com`, and `Host:
+  e.com/evil?x` one with another path and query; of two lines the last
+  one won.
+- **`Response.from_str()` keeps a missing phrase missing**: the `reason`
+  of a response parsed from `HTTP/1.1 200 ` (or `HTTP/2 200`) is `""`,
+  not `None`, so `as_str()` no longer writes the registry's `OK` behind
+  a status line that had no phrase, and `phrase` is empty. `None` still
+  means "not known" and falls back to the registry.
+- **`Response.status` refuses a `bool`** (`TypeError`): `Response(True)`
+  was the status `1` and rendered as `HTTP/1.1 True `. The status of an
+  enum that is an int but not a `Status` is written as its number
+  (`HTTP/1.1 S.OK OK` before).
+- **`url` and `headers` convert what is assigned to them**:
+  `request.url = "https://…"` gives a `Url`, `response.headers = {…}`
+  gives `Headers` — a dict there made every lookup case-sensitive, so
+  the charset was not found and `as_str()` failed. A `Url` or `Headers`
+  instance is taken as it is; anything that is neither raises.
+- **A `bytearray` or `memoryview` body raises a `TypeError`** from the
+  body accessors, `as_str(include_body=True)`, `body_file()` and
+  `save_body()` that says to convert it; it was an `AttributeError`
+  about a missing method.
+- `Request.copy()` and `Response.copy()` take along what has been set on
+  the instance besides the constructor arguments (see Fixed).
+- `repr(request)` redacts the `Request.secret_params` in a fragment
+  that is written like a query as well (`#access_token=…`).
+- `Headers.update()` no longer goes through `set()` for every field; a
+  subclass overriding `set()` to see every change has to override
+  `update()` too.
 
 And from the dependency:
 
@@ -142,6 +197,61 @@ And from the dependency:
 - Reading a named pipe or a non-seekable file object with
   `FileBody.achunks()` on asyncio started a thread per chunk; the daemon
   threads are reused now.
+- `Request.copy()` dropped a `secret_params` set on the instance, so the
+  copy made for a retry or a redirect printed in `repr()` what the
+  original redacted.
+- `repr(request)` printed a token in the fragment of the URL
+  (`https://app.example/cb#access_token=…`) although its name is among
+  the `secret_params`.
+- `as_str(include_body=True)` still raised for some charsets in the
+  `Content-Type`: `undefined` and `idna` (a `UnicodeError`), a name with
+  a NUL (`ValueError`). Every charset Python cannot decode with is read
+  as utf-8 now.
+- The charset was read from inside a quoted parameter value:
+  `multipart/form-data; boundary="a;charset=latin-1"` made `latin-1` the
+  charset of the body. The parameters are split like `get_values()`
+  splits elements, outside of quoted strings only.
+- A blocking iterable read with `IterableBody(..., threaded=True)` and a
+  non-seekable `FileBody` did not see the context variables of the task
+  reading them on asyncio, and a variable set inside such a call was
+  still set for the next, unrelated call served by the same thread. The
+  call runs in a copy of the caller's context, as in the loop's thread
+  pool.
+- On trio, a read that was timed out while it was stuck (a silent pipe,
+  a blocking iterable) kept its place in trio's thread limiter until it
+  returned — forty of them, and no `trio.to_thread.run_sync()` in the
+  process got a thread anymore, this library's cleanup included. These
+  calls no longer count against trio's limiter, as they do not use the
+  loop's thread pool on asyncio.
+- A stream could pass for complete after it had been cut: closing an
+  `IterableBody` / `AsyncIterableBody` with a callback while another
+  thread or task was waiting inside its generator ran the callback, and
+  when the generator — its connection gone — then returned instead of
+  raising, the reader got the chunks so far as the whole body. That read
+  raises the `RuntimeError` of a body closed midway now. A generator
+  closing its own body on its way out is still a regular end.
+- Giving up a read of an `AsyncIterableBody` over a re-iterable source
+  (an object whose `__aiter__` is an async generator function) left the
+  generator of that read open — and what its `finally` releases held —
+  until the loop got around to it; the synchronous `close()` reported
+  nothing to release meanwhile. The generator is closed with the read,
+  and likewise for `IterableBody.achunks()`.
+- The end of a cancelled read with `threaded=True` could raise
+  `ValueError: generator already executing` in place of the
+  cancellation, when the thread left behind entered the generator just
+  as the body closed it.
+- A `SpooledBody` handed out the remains of a write that had failed
+  midway (a full disk) as part of the body: `content_length()` said 4
+  and `as_bytes()` returned 7 bytes. Every reader ends where the last
+  complete write ended.
+- Two `abody_file()` calls on responses sharing a path-based `FileBody`
+  could lose track of one of the files they opened, which `close()` then
+  left open.
+- `Headers`: `items()`, `dict(headers)`, `update()` and equality took
+  time quadratic in the number of lines, every lookup folding every
+  stored name. The fields are indexed once per change.
+- `IterableBody(..., threaded=True)` on trio looked up the name of
+  trio's keyword with `inspect.signature()` for every chunk.
 
 Earlier releases of action0-req accept action0-url 0.2.0 as well, and
 these show up with it:

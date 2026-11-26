@@ -1231,13 +1231,14 @@ class ResponseFromStrTestCase(unittest.TestCase):
     def test_status_line_without_phrase(self) -> None:
         """
         Test both spellings of a status line without a phrase: with the
-        space the grammar asks for, and without it.
+        space the grammar asks for, and without it. The reason is the
+        empty string — what the server sent —, not ``None``.
         """
         for text in ("HTTP/1.1 599 ", "HTTP/1.1 599"):
             with self.subTest(text=text):
                 resp = Response.from_str(text)
                 self.assertEqual(resp.status, 599)
-                self.assertIsNone(resp.reason)
+                self.assertEqual(resp.reason, "")
                 self.assertIsNone(resp.body)
 
     def test_round_trip(self) -> None:
@@ -1605,3 +1606,245 @@ class ResponseAsyncBodyTestCase(unittest.IsolatedAsyncioTestCase):
             file = await resp.abody_file()
             assert file is not None
             self.assertEqual(file.read(), b"chunk1chunk2")
+
+
+class ResponseFromStrPhraseTestCase(unittest.TestCase):
+    """
+    tests for a status line without a phrase read by
+    :py:meth:`action0.req.response.Response.from_str`: no phrase is made
+    up for it
+    """
+
+    def test_no_phrase_is_invented_for_a_registered_code(self) -> None:
+        """
+        Test that a status line with the space and nothing behind it
+        comes back as it was, although the registry has a phrase for the
+        code.
+        """
+        text = "HTTP/1.1 200 \r\nA: b"
+        resp = Response.from_str(text)
+        self.assertEqual(resp.reason, "")
+        self.assertEqual(resp.phrase, "")
+        self.assertEqual(resp.as_str(), text)
+        self.assertEqual(repr(resp), "Response(200)")
+
+    def test_status_line_without_the_space_gains_only_the_space(self) -> None:
+        """
+        Test the documented exception from the round trip: the space
+        behind the status code is always written, a phrase is not added.
+        """
+        resp = Response.from_str("HTTP/2 200\r\nA: b")
+        self.assertEqual(resp.reason, "")
+        self.assertEqual(resp.as_str(), "HTTP/2 200 \r\nA: b")
+
+    def test_constructed_response_still_falls_back_to_the_registry(self) -> None:
+        """
+        Test that ``None`` — the reason is not known — keeps meaning the
+        registry phrase, and that the two are different responses.
+        """
+        self.assertEqual(Response(200).as_str(), "HTTP/1.1 200 OK")
+        self.assertEqual(Response(200, reason="").as_str(), "HTTP/1.1 200 ")
+        self.assertNotEqual(Response(200), Response.from_str("HTTP/1.1 200 "))
+
+    def test_status_code_is_written_as_the_number_it_is(self) -> None:
+        """
+        Test the other documented exception: leading zeros are not kept.
+        """
+        self.assertEqual(Response.from_str("HTTP/1.1 0200 OK").as_str(), "HTTP/1.1 200 OK")
+
+
+class ResponseStatusTypeTestCase(unittest.TestCase):
+    """
+    tests for what counts as a status of
+    :py:class:`action0.req.response.Response` and how it is rendered
+    """
+
+    def test_bool_is_refused(self) -> None:
+        """
+        Test that a bool — an int to Python — is not taken for the
+        status 1 or 0, neither by the constructor nor on assignment.
+        """
+        for value in (True, False):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(TypeError, "got bool"):
+                    Response(value)
+        resp = Response(200)
+        with self.assertRaises(TypeError):
+            resp.status = True
+        self.assertEqual(resp.status, 200)
+
+    def test_int_enum_member_is_rendered_as_its_number(self) -> None:
+        """
+        Test that a member of somebody else's int enum — whose
+        ``format()`` is its name — is written as the status code in the
+        status line and in the repr, and is kept as it was set.
+        """
+        import enum
+
+        class Code(int, enum.Enum):
+            FINE = 200
+            ODD = 599
+
+        resp = Response(Code.FINE)
+        self.assertEqual(resp.as_str(), "HTTP/1.1 200 OK")
+        self.assertEqual(repr(resp), "Response(200 OK)")
+        self.assertIs(resp.status, Code.FINE)
+        self.assertEqual(Response(Code.ODD).as_str(), "HTTP/1.1 599 ")
+        self.assertEqual(Response(Status.NOT_FOUND).as_str(), "HTTP/1.1 404 Not Found")
+
+
+class ResponseStartLineSafetyTestCase(unittest.TestCase):
+    """
+    tests for :py:meth:`action0.req.response.Response.as_str` refusing
+    an HTTP version that would not stay one token of the status line
+    """
+
+    def test_whitespace_in_the_version_is_refused(self) -> None:
+        """
+        Test that a version cannot carry a status and a phrase of its
+        own into the status line.
+        """
+        for version in ("HTTP/1.1 200 OK\tX", "HTTP/1.1 500", "HTTP/1.1\t", ""):
+            with self.subTest(version=version):
+                with self.assertRaisesRegex(ValueError, "HTTP version"):
+                    Response(200, http_version=version).as_str()
+
+    def test_phrase_may_contain_spaces(self) -> None:
+        """
+        Test that the reason phrase, the last part of the line, is not
+        held to that.
+        """
+        self.assertEqual(Response(200, reason="Fine By Me").as_str(), "HTTP/1.1 200 Fine By Me")
+
+
+class ResponseAttributeSettersTestCase(unittest.TestCase):
+    """
+    tests for assigning to
+    :py:attr:`action0.req.response.Response.headers`
+    """
+
+    def test_headers_mapping_is_converted(self) -> None:
+        """
+        Test that a dict assigned as the headers becomes a Headers
+        instance: the charset is found whatever the casing, and the
+        rendering works.
+        """
+        resp = Response(200, body=b"\xe9")
+        resp.headers = {"content-type": "text/plain; charset=latin-1"}
+        self.assertIsInstance(resp.headers, Headers)
+        self.assertEqual(resp.body_str(), "é")
+        self.assertEqual(
+            resp.as_str(include_body=True, separator="\n"),
+            "HTTP/1.1 200 OK\ncontent-type: text/plain; charset=latin-1\n\né",
+        )
+
+    def test_other_forms_and_instances(self) -> None:
+        """
+        Test a raw block and ``None``, and that a Headers instance is
+        taken as it is.
+        """
+        resp = Response(200)
+        resp.headers = "A: 1\r\nB: 2"
+        self.assertEqual(dict(resp.headers), {"A": "1", "B": "2"})
+        resp.headers = None
+        self.assertEqual(len(resp.headers), 0)
+        headers = Headers({"C": "3"})
+        resp.headers = headers
+        self.assertIs(resp.headers, headers)
+
+    def test_invalid_headers_are_refused(self) -> None:
+        """
+        Test that what cannot be headers raises on assignment.
+        """
+        resp = Response(200, headers={"A": "1"})
+        with self.assertRaises(TypeError):
+            resp.headers = cast("Any", 5)
+        self.assertEqual(dict(resp.headers), {"A": "1"})
+
+    def test_copy_takes_instance_attributes_along(self) -> None:
+        """
+        Test that copy() keeps what has been set on the instance besides
+        the parts of a response, as Request.copy() does.
+        """
+        resp = Response(200, headers={"A": "1"})
+        marker = object()
+        resp.__dict__["note"] = marker
+        duplicate = resp.copy(status=404)
+        self.assertIs(duplicate.__dict__["note"], marker)
+        self.assertEqual(duplicate.status, 404)
+        self.assertIsNot(duplicate.headers, resp.headers)
+
+
+class ResponseCharsetTestCase(unittest.TestCase):
+    """
+    tests for the charset a response reads from its Content-Type, where
+    that header is not as plain as usual
+    """
+
+    def test_semicolon_in_a_quoted_parameter(self) -> None:
+        """
+        Test that a ";charset=" inside the quoted value of another
+        parameter is not taken for the charset parameter.
+        """
+        headers = {"Content-Type": 'multipart/form-data; boundary="a;charset=latin-1"'}
+        self.assertEqual(Response(200, headers=headers, body="é").body_bytes(), b"\xc3\xa9")
+        self.assertEqual(
+            Request("https://h/", "POST", headers=headers, body="é").body_bytes(), b"\xc3\xa9"
+        )
+        headers = {"Content-Type": 'text/plain; x="a;charset=nonsense"; charset="latin-1"'}
+        self.assertEqual(Response(200, headers=headers, body=b"\xe9").body_str(), "é")
+
+    def test_rendering_does_not_raise_over_the_charset(self) -> None:
+        """
+        Test that a debug rendering falls back to utf-8 for every
+        charset Python cannot decode with: an unknown one, a codec that
+        is not for text, one that refuses to decode or to replace, and a
+        name with a NUL — the header is the server's to write.
+        """
+        for charset in ("nonsense", "hex", "undefined", "idna", "utf\x008", "rot13"):
+            with self.subTest(charset=charset):
+                headers = Headers()
+                # past the check for the NUL: this is about the body
+                headers._lines.append(("Content-Type", f"text/plain; charset={charset}"))
+                resp = Response(200, body=b"gr\xc3\xbc\xdf")
+                resp.headers = headers
+                self.assertTrue(resp.as_str(include_body=True).endswith("\r\n\r\ngrü\ufffd"))
+                req = Request("https://h/", "POST", body=b"ok")
+                req.headers = headers
+                self.assertTrue(req.as_str(include_body=True).endswith("\r\n\r\nok"))
+
+
+class ResponseBodyTypeTestCase(unittest.IsolatedAsyncioTestCase):
+    """
+    tests for a response body of a type that is bytes-like but not a
+    body: ``bytearray`` and ``memoryview``
+    """
+
+    async def test_every_way_to_the_body_says_what_is_wrong(self) -> None:
+        """
+        Test that the accessors, the file views and the save helpers
+        raise a TypeError naming the type.
+        """
+        for body in (bytearray(b"x"), memoryview(b"x")):
+            resp = Response(200, body=cast("Any", body))
+            target = io.BytesIO()
+            for access in (
+                resp.body_bytes,
+                resp.body_str,
+                resp.body_producer,
+                resp.body_file,
+                lambda resp=resp: resp.as_str(include_body=True),
+                lambda resp=resp, target=target: resp.save_body(target),
+            ):
+                with self.subTest(body=type(body).__name__, access=access):
+                    with self.assertRaisesRegex(TypeError, "convert it with bytes"):
+                        access()
+            for aaccess in (resp.abody_bytes, resp.abody_str, resp.abody_file):
+                with self.subTest(body=type(body).__name__, access=aaccess):
+                    with self.assertRaisesRegex(TypeError, "convert it with bytes"):
+                        await aaccess()
+            with self.assertRaisesRegex(TypeError, "convert it with bytes"):
+                await resp.asave_body(target)
+            self.assertEqual(target.getvalue(), b"")
+            # closing looks at no content
+            resp.close()

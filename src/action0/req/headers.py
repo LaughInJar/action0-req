@@ -1,6 +1,7 @@
 """The :py:class:`Headers` mapping and the known header field names (:py:class:`Header`)."""
 
 import re
+import string
 from enum import StrEnum
 from typing import Iterable
 from typing import Iterator
@@ -36,6 +37,25 @@ _UNSAFE = re.compile(r"[\r\n\x00]")
 
 _UNSAFE_NAMES = {"\r": "a carriage return", "\n": "a line feed", "\x00": "a NUL character"}
 
+_ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+
+
+def _fold(name: str) -> str:
+    """
+    The form of a field name that lookups compare: its ASCII letters in
+    lowercase, everything else as it is. That is how HTTP matches names.
+    Deliberately neither ``str.casefold()`` nor ``str.lower()`` on the
+    whole name: they also map characters from outside ASCII onto ASCII
+    letters ("ſ" to "s", the Kelvin sign to "k"), which would make
+    ``"Hoſt"`` the ``Host`` header here and a field of its own for every
+    peer.
+
+    :param name: the field name
+    :return: the name to compare with
+    """
+    # str.lower() is only safe (and much faster) for an all-ASCII name
+    return name.lower() if name.isascii() else name.translate(_ASCII_LOWER)
+
 
 def _check_safe(text: str, what: str) -> None:
     """
@@ -54,15 +74,62 @@ def _check_safe(text: str, what: str) -> None:
         )
 
 
-def _not_text(value: object) -> TypeError:
+def _check_token(text: str, what: str) -> None:
     """
-    :param value: a bytes-like header value
+    Refuse a text that would not stay in one piece on the wire: the
+    method, the target and the version in a start line are separated by
+    single spaces, so whitespace inside one of them makes it two.
+
+    :param text: the text to check
+    :param what: what the text is, for the error message (e.g. "method")
+    :raises ValueError: if the text is empty or contains a CR, an LF, a
+                        NUL or any other whitespace
+    """
+    if not text:
+        raise ValueError(f"the {what} must not be empty")
+    _check_safe(text, what)
+    if any(char.isspace() for char in text):
+        raise ValueError(
+            f"{what} contains whitespace, which would split it in two on the wire: {text!r}"
+        )
+
+
+def _check_name(name: str) -> None:
+    """
+    Refuse a field name that would not be read as the name it is: an
+    empty one, one with whitespace (``"Name : value"`` is a request
+    smuggling vector, a leading blank is line folding) and one with a
+    colon, which ends the name on the wire.
+
+    :param name: the field name
+    :raises ValueError: if the name is empty or contains a CR, an LF, a
+                        NUL, any other whitespace or a colon
+    """
+    if not name:
+        raise ValueError("a header name must not be empty")
+    _check_safe(name, "header name")
+    if any(char.isspace() for char in name):
+        raise ValueError(
+            "header name contains whitespace, which a recipient rejects or takes for "
+            f"another field: {name!r}"
+        )
+    if ":" in name:
+        raise ValueError(
+            f"header name contains a colon, which ends the name on the wire: {name!r}"
+        )
+
+
+def _not_a_value(value: object) -> TypeError:
+    """
+    :param value: something that is not a header value
     :return: the error to raise for it
     """
-    # str() would turn it into "b'...'", iterating it into numbers
+    hint = ""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        # str() would turn it into "b'...'", iterating it into numbers
+        hint = ": decode it first"
     return TypeError(
-        f"a header value must be a str, int, float or bool, got {type(value).__name__}: "
-        "decode it first"
+        f"a header value must be a str, int, float or bool, got {type(value).__name__}{hint}"
     )
 
 
@@ -72,16 +139,19 @@ def _coerce_value(value: HeaderValue) -> str:
 
     :param value: the value to coerce
     :return: the value as a string, bools as "true" / "false"
-    :raises TypeError: for bytes — a header value is text
+    :raises TypeError: for anything else — bytes (a header value is
+                       text), ``None`` (which would be sent as the
+                       string "None"), ...
     """
-    # bool before the plain str() fallback: bools use the web convention
+    # bool before the plain str() of the numbers: bools use the web
+    # convention
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, str):
         return value
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        raise _not_text(value)
-    return str(value)
+    if isinstance(value, (int, float)):
+        return str(value)
+    raise _not_a_value(value)
 
 
 def _coerce_values(value_s: Union[HeaderValue, Iterable[HeaderValue]]) -> list[str]:
@@ -90,13 +160,14 @@ def _coerce_values(value_s: Union[HeaderValue, Iterable[HeaderValue]]) -> list[s
 
     :param value_s: a single value or an iterable of values
     :return: all values as a list of strings
-    :raises TypeError: for bytes, as the value or as one of the values
+    :raises TypeError: for what is not a value (bytes, ``None``, ...),
+                       as the value or as one of the values
     """
-    if isinstance(value_s, (bytes, bytearray, memoryview)):
-        # they are iterables too — of numbers
-        raise _not_text(value_s)
     if isinstance(value_s, (str, int, float, bool)):
         return [_coerce_value(value_s)]
+    if isinstance(value_s, (bytes, bytearray, memoryview)) or not isinstance(value_s, Iterable):
+        # bytes are iterables too — of numbers
+        raise _not_a_value(value_s)
     return [_coerce_value(value_) for value_ in value_s]
 
 
@@ -108,26 +179,31 @@ def _lines(name: str, value_s: Union[HeaderValue, Iterable[HeaderValue]]) -> lis
     :param name: the field name
     :param value_s: a single value or an iterable of values (one line each)
     :return: the lines as name/value tuples
-    :raises TypeError: if the name is not a string or a value is bytes
-    :raises ValueError: if the name or a value contains a CR, an LF or a
-                        NUL
+    :raises TypeError: if the name is not a string or a value is not a
+                       str, int, float or bool
+    :raises ValueError: if the name is empty or contains whitespace or a
+                        colon; if the name or a value contains a CR, an
+                        LF or a NUL
     """
     if not isinstance(name, str):
         raise TypeError(f"a header name must be a str, got {type(name).__name__}: {name!r}")
-    _check_safe(name, "header name")
+    _check_name(name)
     values = _coerce_values(value_s)
     for value in values:
         _check_safe(value, f"value of the header {name!r}")
     return [(name, value) for value in values]
 
 
-def _split_elements(line: str) -> Iterator[str]:
+def _split_elements(line: str, separator: str = ",") -> Iterator[str]:
     """
     Split a header value at the commas of the list syntax (:rfc:`9110`,
     section 5.6.1). A comma inside a quoted string (``"a,b"``, with
-    ``\\`` escaping the next character) is part of the element.
+    ``\\`` escaping the next character) is part of the element. The
+    parameters of a value (``text/plain; charset=utf-8``) are split the
+    same way, at ``";"``.
 
     :param line: the value of one header line
+    :param separator: the character separating the elements
     :return: the elements as written, not stripped
     """
     start = 0
@@ -143,7 +219,7 @@ def _split_elements(line: str) -> Iterator[str]:
                 quoted = False
         elif char == '"':
             quoted = True
-        elif char == ",":
+        elif char == separator:
             yield line[start:index]
             start = index + 1
     # a quote that is never closed takes the rest of the line along
@@ -158,7 +234,9 @@ class Headers(MutableMapping[str, str]):
     lookup matches field names case-insensitively (per :rfc:`9110` —
     ``headers["content-type"]`` and ``headers["Content-Type"]`` hit the
     same field). Names are never normalized beyond that; in particular an
-    underscore is not treated as a dash.
+    underscore is not treated as a dash. Only the ASCII letters are
+    matched without regard to case, as on the wire: a lookalike from
+    outside ASCII (``"Hoſt"``) is a field of its own.
 
     Headers implements :py:class:`typing.MutableMapping`: the mapping view
     (``headers[name]``, ``headers.get(name)``, ``items()``, ...) works with a
@@ -191,7 +269,9 @@ class Headers(MutableMapping[str, str]):
     A name or a value that would break out of its line on the wire — one
     containing a carriage return, a line feed or a NUL — is refused with
     a :py:class:`ValueError`, wherever it comes from: a value taken from
-    user input cannot smuggle in a field of its own.
+    user input cannot smuggle in a field of its own. So is a name that
+    would not be read as that name: an empty one, one with whitespace or
+    with a colon.
 
         >>> headers.add("X-Trace", "abc\r\nSet-Cookie: admin=1")
         Traceback (most recent call last):
@@ -209,11 +289,17 @@ class Headers(MutableMapping[str, str]):
             "x-csrf-token",
         }
     )
-    """The (casefolded) names of the fields whose values carry secrets and
+    """The (lowercase) names of the fields whose values carry secrets and
     are shown as ``***`` by ``repr()``. Override on a subclass or instance
     to redact more (or fewer) fields; :py:meth:`copy` — and with it a
     request or response taking the headers over — keeps both the subclass
     and an instance's own set."""
+
+    # the fields by folded name, each with the name of its first line and
+    # the values of all its lines: built on the first lookup, dropped by
+    # everything that changes the lines. A class attribute as the default,
+    # so an instance from an older pickle has it too
+    _index: Union[dict[str, tuple[str, list[str]]], None] = None
 
     def __init__(self, headers: Union[HeaderTypes, None] = None) -> None:
         r"""
@@ -225,15 +311,19 @@ class Headers(MutableMapping[str, str]):
                         instance whose lines are copied, or as a list of
                         tuples or a dictionary. The values can be single
                         values or lists of values (one line each);
-                        non-string values are coerced to strings (bools
-                        become "true" / "false").
+                        numbers are coerced to strings (bools become
+                        "true" / "false").
         :raises ValueError: if a line of a raw header block has no ``":"``
                             or its name is empty or contains whitespace
                             (also right before the ``":"`` — what
                             :rfc:`9112` tells a parser to reject); if a
-                            name or value contains a CR, an LF or a NUL
-        :raises TypeError: if a value is bytes, or an item of an iterable
-                           is a string instead of a name/value tuple
+                            name given in any other form is empty or
+                            contains whitespace or a colon; if a name or
+                            value contains a CR, an LF or a NUL
+        :raises TypeError: if a value is not a str, int, float or bool
+                           (bytes, ``None``, ...), an item of an iterable
+                           is a string instead of a name/value tuple, or
+                           the headers are none of the forms above
         """
         self._lines: list[tuple[str, str]] = []
 
@@ -271,6 +361,32 @@ class Headers(MutableMapping[str, str]):
                 name, value_s = item
                 self.add(name, value_s)
 
+        elif headers is not None:
+            raise TypeError(
+                "headers must be a raw header block, a mapping, an iterable of "
+                f"(name, value) tuples or a Headers instance, got {type(headers).__name__}"
+            )
+
+    def _fields(self) -> dict[str, tuple[str, list[str]]]:
+        """
+        :return: the fields by folded name, in the order of their first
+                 lines: the name as that first line spells it, and the
+                 values of all lines of the field. Not to be modified —
+                 it is kept for the next lookup
+        """
+        index = self._index
+        if index is None:
+            index = {}
+            for name, value in self._lines:
+                folded = _fold(name)
+                field = index.get(folded)
+                if field is None:
+                    index[folded] = (name, [value])
+                else:
+                    field[1].append(value)
+            self._index = index
+        return index
+
     def __getitem__(self, name: str) -> str:
         """
         The single value of the field; if the field has multiple lines,
@@ -281,11 +397,10 @@ class Headers(MutableMapping[str, str]):
         :return: the (last) value of the field
         :raises KeyError: if the field does not exist
         """
-        folded = name.casefold()
-        for line_name, value in reversed(self._lines):
-            if line_name.casefold() == folded:
-                return value
-        raise KeyError(name)
+        field = self._fields().get(_fold(name))
+        if field is None:
+            raise KeyError(name)
+        return field[1][-1]
 
     def __setitem__(self, name: str, value: Union[HeaderValue, Iterable[HeaderValue]]) -> None:
         """
@@ -311,28 +426,21 @@ class Headers(MutableMapping[str, str]):
         :return: an iterator over the distinct field names in the order of
                  their first line, each in the casing of that first line
         """
-        seen: set[str] = set()
-        for name, _ in self._lines:
-            folded = name.casefold()
-            if folded not in seen:
-                seen.add(folded)
-                yield name
+        # a list of its own: the fields may change while it is iterated
+        return iter([name for name, _ in self._fields().values()])
 
     def __len__(self) -> int:
         """
         :return: the number of distinct field names
         """
-        return len({name.casefold() for name, _ in self._lines})
+        return len(self._fields())
 
     def __contains__(self, name: object) -> bool:
         """
         :param name: the field name (case-insensitive)
         :return: whether a field with this name exists
         """
-        if not isinstance(name, str):
-            return False
-        folded = name.casefold()
-        return any(line_name.casefold() == folded for line_name, _ in self._lines)
+        return isinstance(name, str) and _fold(name) in self._fields()
 
     def get_all(self, name: str) -> list[str]:
         """
@@ -344,8 +452,8 @@ class Headers(MutableMapping[str, str]):
         :return: the values as a list, an empty list if the field does
                  not exist
         """
-        folded = name.casefold()
-        return [value for line_name, value in self._lines if line_name.casefold() == folded]
+        field = self._fields().get(_fold(name))
+        return [] if field is None else list(field[1])
 
     def get_values(self, name: str) -> list[str]:
         """
@@ -383,11 +491,14 @@ class Headers(MutableMapping[str, str]):
 
         :param name: the field name to add (stored in the given casing)
         :param value: the value or list of values to add (one line each)
-        :raises ValueError: if the name or a value contains a CR, an LF
-                            or a NUL
-        :raises TypeError: if the name is not a string or a value is bytes
+        :raises ValueError: if the name is empty or contains whitespace
+                            or a colon; if the name or a value contains
+                            a CR, an LF or a NUL
+        :raises TypeError: if the name is not a string or a value is not
+                           a str, int, float or bool
         """
         self._lines.extend(_lines(name, value))
+        self._index = None
 
     def remove(
         self, name: str, value: Union[HeaderValue, Iterable[HeaderValue], None] = None
@@ -403,18 +514,19 @@ class Headers(MutableMapping[str, str]):
                       removed, not the entire field
         :return: a list of removed values
         """
-        folded = name.casefold()
+        folded = _fold(name)
         value_list = None if value is None else _coerce_values(value)
 
         kept: list[tuple[str, str]] = []
         removed: list[str] = []
         for line_name, line_value in self._lines:
-            if line_name.casefold() == folded and (value_list is None or line_value in value_list):
+            if _fold(line_name) == folded and (value_list is None or line_value in value_list):
                 removed.append(line_value)
             else:
                 kept.append((line_name, line_value))
 
         self._lines = kept
+        self._index = None
         return removed
 
     def set(self, name: str, value: Union[HeaderValue, Iterable[HeaderValue]]) -> None:
@@ -426,20 +538,22 @@ class Headers(MutableMapping[str, str]):
         :param name: the field name (matched case-insensitively, stored in
                      the given casing)
         :param value: a single value or a list of values (one line each)
-        :raises ValueError: if the name or a value contains a CR, an LF
-                            or a NUL
-        :raises TypeError: if the name is not a string or a value is bytes
+        :raises ValueError: if the name is empty or contains whitespace
+                            or a colon; if the name or a value contains
+                            a CR, an LF or a NUL
+        :raises TypeError: if the name is not a string or a value is not
+                           a str, int, float or bool
         """
         lines = _lines(name, value)
         if not lines:
             self.remove(name)
             return
 
-        folded = name.casefold()
+        folded = _fold(name)
         new_lines: list[tuple[str, str]] = []
         inserted = False
         for line_name, line_value in self._lines:
-            if line_name.casefold() == folded:
+            if _fold(line_name) == folded:
                 # replace the first line of the field with the new lines,
                 # drop the others
                 if not inserted:
@@ -450,6 +564,7 @@ class Headers(MutableMapping[str, str]):
         if not inserted:
             new_lines.extend(lines)
         self._lines = new_lines
+        self._index = None
 
     # narrower than the MutableMapping contract on purpose: update() accepts
     # the same input forms as the constructor (e.g. a raw header block) and
@@ -470,8 +585,26 @@ class Headers(MutableMapping[str, str]):
         if headers is None:
             return
         other = headers if isinstance(headers, Headers) else Headers(headers)
-        for name in other:
-            self.set(name, other.get_all(name))
+        # one pass over the lines, whatever the number of fields: what
+        # set() does for a single field, for all of them at once
+        fields = other._fields()
+        new_lines: list[tuple[str, str]] = []
+        replaced: set[str] = set()
+        for line_name, line_value in self._lines:
+            folded = _fold(line_name)
+            field = fields.get(folded)
+            if field is None:
+                new_lines.append((line_name, line_value))
+            elif folded not in replaced:
+                # the new lines take the place of the field's first line,
+                # its other lines are dropped
+                replaced.add(folded)
+                new_lines.extend((field[0], value) for value in field[1])
+        for folded, (name, values) in fields.items():
+            if folded not in replaced:
+                new_lines.extend((name, value) for value in values)
+        self._lines = new_lines
+        self._index = None
 
     def clear(self) -> list[tuple[str, str]]:  # type: ignore[override]  # ty: ignore[invalid-method-override]
         """
@@ -482,6 +615,7 @@ class Headers(MutableMapping[str, str]):
         """
         old = self._lines
         self._lines = []
+        self._index = None
         return old
 
     def copy(self) -> Self:
@@ -495,17 +629,19 @@ class Headers(MutableMapping[str, str]):
         duplicate = self.__class__.__new__(self.__class__)
         duplicate.__dict__.update(self.__dict__)
         duplicate._lines = list(self._lines)
+        duplicate._index = None
         return duplicate
 
     def sort(self) -> None:
         """
-        Sort the lines in place by their (casefolded) field name. The sort
+        Sort the lines in place by their (lowercase) field name. The sort
         is stable: lines of the same field keep their relative order —
         unlike :py:meth:`~action0.url.params.Params.sort`, values are
         never reordered because their order can be significant (e.g.
         ``Set-Cookie``).
         """
-        self._lines.sort(key=lambda line: line[0].casefold())
+        self._lines.sort(key=lambda line: _fold(line[0]))
+        self._index = None
 
     def as_str(self, separator: str = "\r\n") -> str:
         r"""
@@ -531,12 +667,7 @@ class Headers(MutableMapping[str, str]):
                  (in the casing of each field's first line) and the values
                  as lists of strings
         """
-        result: dict[str, list[str]] = {}
-        canonical: dict[str, str] = {}
-        for name, value in self._lines:
-            key = canonical.setdefault(name.casefold(), name)
-            result.setdefault(key, []).append(value)
-        return result
+        return {name: list(values) for name, values in self._fields().values()}
 
     def singles(self) -> dict[str, str]:
         """
@@ -553,13 +684,10 @@ class Headers(MutableMapping[str, str]):
 
     def _folded(self) -> dict[str, list[str]]:
         """
-        :return: the fields keyed by casefolded name for order- and
+        :return: the fields keyed by folded name for order- and
                  casing-insensitive comparison
         """
-        result: dict[str, list[str]] = {}
-        for name, value in self._lines:
-            result.setdefault(name.casefold(), []).append(value)
-        return result
+        return {folded: values for folded, (_, values) in self._fields().items()}
 
     def __eq__(self, other: object) -> bool:
         """
@@ -595,7 +723,7 @@ class Headers(MutableMapping[str, str]):
                  :py:meth:`as_str` ever renders the secret values.
         """
         rendered = ", ".join(
-            f"{name}: {'***' if name.casefold() in self.secret_names else value}"
+            f"{name}: {'***' if _fold(name) in self.secret_names else value}"
             for name, value in self._lines
         )
         return f"{self.__class__.__name__}({rendered})"

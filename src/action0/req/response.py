@@ -27,6 +27,7 @@ from .body import _charset
 from .body import _close_body
 from .body import _close_on_exit
 from .body import _in_thread
+from .body import _producer
 from .body import _rendered_body
 from .body import _SpooledStream
 from .body import asave_body
@@ -34,6 +35,7 @@ from .body import save_body
 from .headers import Headers
 from .headers import HeaderTypes
 from .headers import _check_safe
+from .headers import _check_token
 from .headers import _own_headers
 from .request import Request
 from .request import _split_message
@@ -43,8 +45,9 @@ from .status import Status
 class Response:
     r"""
     Python representation of an HTTP response: status, headers, body and
-    HTTP version — every part a plain mutable attribute (the headers a
-    :py:class:`~action0.req.headers.Headers`).
+    HTTP version — every part a mutable attribute (the headers a
+    :py:class:`~action0.req.headers.Headers`; a mapping assigned to them
+    is converted).
 
     Example::
 
@@ -92,19 +95,18 @@ class Response:
     :py:attr:`request` and :py:attr:`meta`.
     """
 
-    headers: Headers
-    """The header fields, the response's own
-    :py:class:`~action0.req.headers.Headers` instance."""
-
     body: Union[BodyTypes, None]
     """The body as it was set: ``bytes``, ``str``, a
     :py:class:`~action0.req.body.BodyProducer` or ``None``.
     :py:meth:`body_file` replaces a streamed body with the
-    :py:class:`~action0.req.body.SpooledBody` it was read into."""
+    :py:class:`~action0.req.body.SpooledBody` it was read into. Nothing
+    else is a body — for a ``bytearray`` or a ``memoryview`` the
+    accessors raise a :py:class:`TypeError`: pass ``bytes(...)``."""
 
     reason: Union[str, None]
-    """The reason phrase as sent by the server, ``None`` if there is
-    none — :py:attr:`phrase` falls back to the registry then."""
+    """The reason phrase as sent by the server. ``None`` if it is not
+    known — :py:attr:`phrase` falls back to the registry then —, an
+    empty string for a server that sent none."""
 
     http_version: str
     """The protocol version rendered in the status line."""
@@ -142,7 +144,8 @@ class Response:
                      :py:class:`~action0.req.body.BodyProducer`
         :param reason: the reason phrase as sent by the server; ``None``
                        falls back to the registry phrase of the status code
-                       (see :py:attr:`phrase`)
+                       (see :py:attr:`phrase`), an empty string stands
+                       for a status line without a phrase
         :param http_version: the protocol version rendered in the status
                              line
         :param request: the request that produced this response — metadata:
@@ -152,6 +155,7 @@ class Response:
         :raises TypeError: if the status is not an int
         """
         self.status = status
+        # copied on ingestion; the setter takes it as it is
         self.headers = _own_headers(headers)
         self.body = body
         self.reason = reason
@@ -164,9 +168,9 @@ class Response:
         """
         The status code: any int, registered or not — a
         :py:class:`~action0.req.status.Status` member is one. Setting
-        anything else (the string ``"404"``, say) raises a
-        :py:class:`TypeError` right away instead of failing later in a
-        comparison.
+        anything else (the string ``"404"``, say, or a ``bool``, which
+        Python counts among the ints) raises a :py:class:`TypeError`
+        right away instead of failing later in a comparison.
         """
         # kept in the instance dict under its public name: that is where
         # a plain attribute lives, so pickles from before this was a
@@ -175,12 +179,35 @@ class Response:
 
     @status.setter
     def status(self, value: int) -> None:
-        if not isinstance(value, int):
+        # a bool is an int, but True is not the status 1
+        if not isinstance(value, int) or isinstance(value, bool):
             raise TypeError(
                 f"the status must be an int (a Status member is one), "
                 f"got {type(value).__name__}: {value!r}"
             )
         self.__dict__["status"] = value
+
+    @property
+    def headers(self) -> Headers:
+        """
+        The header fields, a :py:class:`~action0.req.headers.Headers`. A
+        ``Headers`` instance that is assigned becomes the response's
+        headers as it is (only the constructor copies); every other form
+        the ``Headers`` constructor accepts — a mapping, a list of
+        tuples, a raw header block, ``None`` for none — is converted, so
+        the lookups stay case-insensitive::
+
+            >>> resp = Response(200)
+            >>> resp.headers = {"content-type": "text/plain"}
+            >>> resp.headers["Content-Type"]
+            'text/plain'
+        """
+        # in the instance dict under its public name, like the status
+        return cast("Headers", self.__dict__["headers"])
+
+    @headers.setter
+    def headers(self, value: Union[HeaderTypes, None]) -> None:
+        self.__dict__["headers"] = value if isinstance(value, Headers) else Headers(value)
 
     @classmethod
     def from_str(cls, text: str) -> Self:
@@ -201,9 +228,14 @@ class Response:
 
         The phrase of the status line becomes the :py:attr:`reason` —
         it is what the server sent, also where it equals the registry
-        phrase. ``Response.from_str(text).as_str(...)`` gives the text
+        phrase, and also where it is empty: a response parsed from
+        ``"HTTP/1.1 200 "`` has the reason ``""`` and no phrase is made
+        up for it. ``Response.from_str(text).as_str(...)`` gives the text
         back as it was (with ``include_body=True`` and the separator of
-        the text).
+        the text) — but for what a status line always is here: the
+        status code is written as the number it is (``0200`` as
+        ``200``), and the space behind it is there also if the text had
+        none (``"HTTP/2 200"`` comes back as ``"HTTP/2 200 "``).
 
         :param text: the response as text; the body is whatever follows
                      the first blank line and is taken as a ``str``
@@ -220,7 +252,9 @@ class Response:
         parts = start.split(" ", 2)
         if len(parts) < 2 or not parts[0] or not (parts[1].isascii() and parts[1].isdigit()):
             raise ValueError(f"invalid status line: {start!r}")
-        reason = parts[2] if len(parts) > 2 and parts[2] else None
+        # no phrase is no phrase: None would make as_str() write the
+        # registry's, which the server did not send
+        reason = parts[2] if len(parts) > 2 else ""
         return cls(
             int(parts[1]),
             headers=Headers(fields),
@@ -419,6 +453,7 @@ class Response:
             file = body._file_view()
             if file is not None:
                 return file
+        body = _producer(body)
         close = getattr(body, "close", None)
         spool: SpooledBody
         if callable(close) or getattr(body, "aclose", None) is None:
@@ -489,6 +524,7 @@ class Response:
             file = await _in_thread(body._file_view)
             if file is not None:
                 return file
+        body = _producer(body)
         spool = SpooledBody(max_memory=max_memory, dir=dir)
         chunks = body.achunks()
         try:
@@ -646,7 +682,8 @@ class Response:
         in particular a :py:class:`~action0.req.body.BodyProducer` is
         shared, not copied; the ``meta`` values are shared too (shallow
         copy). The copy is of the same class as this response, and so are
-        its headers.
+        its headers. Whatever else has been set on this instance goes
+        along as well.
 
         Sharing a streamed body means sharing its single use: once one
         copy has read it (also by :py:meth:`body_file`, which keeps the
@@ -671,7 +708,12 @@ class Response:
             "meta": self.meta,
         }
         kwargs.update(overrides)
-        return self.__class__(**kwargs)
+        duplicate = self.__class__(**kwargs)
+        # the constructor has set the parts of a response; what it knows
+        # nothing about is taken over (shared, like the body)
+        for name, value in self.__dict__.items():
+            duplicate.__dict__.setdefault(name, value)
+        return duplicate
 
     def as_str(self, include_body: bool = False, separator: str = "\r\n") -> str:
         r"""
@@ -693,12 +735,18 @@ class Response:
         :return: e.g. ``"HTTP/1.1 404 Not Found\r\nContent-Length: 0"``
         :raises ValueError: if the HTTP version or the reason phrase
                             contains a CR, an LF or a NUL — it would
-                            start a line of its own
+                            start a line of its own —, or the HTTP
+                            version is empty or contains any other
+                            whitespace: it would not be read as one
+        :raises TypeError: if the body is a ``bytearray`` or a
+                           ``memoryview`` (with ``include_body``)
         """
         phrase = self.phrase
-        _check_safe(self.http_version, "HTTP version")
+        _check_token(self.http_version, "HTTP version")
         _check_safe(phrase, "reason phrase")
-        lines = [f"{self.http_version} {self.status} {phrase}"]
+        # int(): an enum member that is an int is the status it stands
+        # for, not its name
+        lines = [f"{self.http_version} {int(self.status)} {phrase}"]
         if self.headers:
             lines.append(self.headers.as_str(separator))
         rendered = separator.join(lines)
@@ -741,5 +789,5 @@ class Response:
                  rendering is only available explicitly via
                  :py:meth:`as_str`.
         """
-        inner = f"{self.status} {self.phrase}".rstrip()
+        inner = f"{int(self.status)} {self.phrase}".rstrip()
         return f"{self.__class__.__name__}({inner})"
