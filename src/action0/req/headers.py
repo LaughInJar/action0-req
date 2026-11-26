@@ -1,10 +1,12 @@
 """The :py:class:`Headers` mapping and the known header field names (:py:class:`Header`)."""
 
+import re
 from enum import StrEnum
 from typing import Iterable
 from typing import Iterator
 from typing import Mapping
 from typing import MutableMapping
+from typing import Self
 from typing import Union
 from typing import cast
 
@@ -23,18 +25,62 @@ HeaderTypes = Union[
 header block, a mapping, or an iterable of name/value(s) tuples."""
 
 
+# the line separators of a raw header block. Deliberately not
+# str.splitlines(): that also splits at a lone "\r", at "\x0b", "\x0c",
+# "\x85", U+2028, ... — characters that are part of a value, not line ends
+_LINE_END = re.compile(r"\r?\n")
+
+# what must never be part of a header name or value: it would end the line
+# (or, for NUL, the string) on the wire and let a value smuggle in a field
+_UNSAFE = re.compile(r"[\r\n\x00]")
+
+_UNSAFE_NAMES = {"\r": "a carriage return", "\n": "a line feed", "\x00": "a NUL character"}
+
+
+def _check_safe(text: str, what: str) -> None:
+    """
+    Refuse a text that would break out of its line in the wire format.
+
+    :param text: the text to check
+    :param what: what the text is, for the error message (e.g. "header
+                 value")
+    :raises ValueError: if the text contains a CR, an LF or a NUL
+    """
+    match = _UNSAFE.search(text)
+    if match is not None:
+        raise ValueError(
+            f"{what} contains {_UNSAFE_NAMES[match.group()]}, "
+            f"which would start a new line on the wire: {text!r}"
+        )
+
+
+def _not_text(value: object) -> TypeError:
+    """
+    :param value: a bytes-like header value
+    :return: the error to raise for it
+    """
+    # str() would turn it into "b'...'", iterating it into numbers
+    return TypeError(
+        f"a header value must be a str, int, float or bool, got {type(value).__name__}: "
+        "decode it first"
+    )
+
+
 def _coerce_value(value: HeaderValue) -> str:
     """
     Coerce a single header value to its string representation.
 
     :param value: the value to coerce
     :return: the value as a string, bools as "true" / "false"
+    :raises TypeError: for bytes — a header value is text
     """
     # bool before the plain str() fallback: bools use the web convention
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, str):
         return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raise _not_text(value)
     return str(value)
 
 
@@ -44,10 +90,64 @@ def _coerce_values(value_s: Union[HeaderValue, Iterable[HeaderValue]]) -> list[s
 
     :param value_s: a single value or an iterable of values
     :return: all values as a list of strings
+    :raises TypeError: for bytes, as the value or as one of the values
     """
+    if isinstance(value_s, (bytes, bytearray, memoryview)):
+        # they are iterables too — of numbers
+        raise _not_text(value_s)
     if isinstance(value_s, (str, int, float, bool)):
         return [_coerce_value(value_s)]
     return [_coerce_value(value_) for value_ in value_s]
+
+
+def _lines(name: str, value_s: Union[HeaderValue, Iterable[HeaderValue]]) -> list[tuple[str, str]]:
+    """
+    The header lines for a field name and its value(s), checked: this is
+    the one way lines get into a :py:class:`Headers` instance.
+
+    :param name: the field name
+    :param value_s: a single value or an iterable of values (one line each)
+    :return: the lines as name/value tuples
+    :raises TypeError: if the name is not a string or a value is bytes
+    :raises ValueError: if the name or a value contains a CR, an LF or a
+                        NUL
+    """
+    if not isinstance(name, str):
+        raise TypeError(f"a header name must be a str, got {type(name).__name__}: {name!r}")
+    _check_safe(name, "header name")
+    values = _coerce_values(value_s)
+    for value in values:
+        _check_safe(value, f"value of the header {name!r}")
+    return [(name, value) for value in values]
+
+
+def _split_elements(line: str) -> Iterator[str]:
+    """
+    Split a header value at the commas of the list syntax (:rfc:`9110`,
+    section 5.6.1). A comma inside a quoted string (``"a,b"``, with
+    ``\\`` escaping the next character) is part of the element.
+
+    :param line: the value of one header line
+    :return: the elements as written, not stripped
+    """
+    start = 0
+    quoted = False
+    escaped = False
+    for index, char in enumerate(line):
+        if escaped:
+            escaped = False
+        elif quoted:
+            if char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char == ",":
+            yield line[start:index]
+            start = index + 1
+    # a quote that is never closed takes the rest of the line along
+    yield line[start:]
 
 
 class Headers(MutableMapping[str, str]):
@@ -61,7 +161,7 @@ class Headers(MutableMapping[str, str]):
     underscore is not treated as a dash.
 
     Headers implements :py:class:`typing.MutableMapping`: the mapping view
-    (``headers[name]``, :py:meth:`get`, ``items()``, ...) works with a
+    (``headers[name]``, ``headers.get(name)``, ``items()``, ...) works with a
     single value per name — the last one, like :py:meth:`singles`.
     Multi-value access is available through :py:meth:`get_all`,
     :py:meth:`get_values`, :py:meth:`add`, :py:meth:`as_dict` and
@@ -87,6 +187,16 @@ class Headers(MutableMapping[str, str]):
         >>> headers["Authorization"] = "Bearer secret-token"
         >>> headers
         Headers(Content-Type: text/html, Set-Cookie: ***, set-cookie: ***, Authorization: ***)
+
+    A name or a value that would break out of its line on the wire — one
+    containing a carriage return, a line feed or a NUL — is refused with
+    a :py:class:`ValueError`, wherever it comes from: a value taken from
+    user input cannot smuggle in a field of its own.
+
+        >>> headers.add("X-Trace", "abc\r\nSet-Cookie: admin=1")
+        Traceback (most recent call last):
+            ...
+        ValueError: value of the header 'X-Trace' contains a carriage return, which would start a new line on the wire: 'abc\r\nSet-Cookie: admin=1'
     """
 
     secret_names: frozenset[str] = frozenset(
@@ -101,20 +211,29 @@ class Headers(MutableMapping[str, str]):
     )
     """The (casefolded) names of the fields whose values carry secrets and
     are shown as ``***`` by ``repr()``. Override on a subclass or instance
-    to redact more (or fewer) fields."""
+    to redact more (or fewer) fields; :py:meth:`copy` — and with it a
+    request or response taking the headers over — keeps both the subclass
+    and an instance's own set."""
 
     def __init__(self, headers: Union[HeaderTypes, None] = None) -> None:
         r"""
         :param headers: the initial header lines, either as a raw header
                         block (lines of ``"Name: value"`` separated by
-                        ``"\r\n"`` or ``"\n"``; blank lines are skipped,
-                        obsolete line folding is not supported), another
-                        Headers instance whose lines are copied, or as a
-                        list of tuples or a dictionary. The values can be
-                        single values or lists of values (one line each);
+                        ``"\r\n"`` or ``"\n"`` — nothing else ends a
+                        line; blank lines are skipped, obsolete line
+                        folding is not supported), another Headers
+                        instance whose lines are copied, or as a list of
+                        tuples or a dictionary. The values can be single
+                        values or lists of values (one line each);
                         non-string values are coerced to strings (bools
                         become "true" / "false").
         :raises ValueError: if a line of a raw header block has no ``":"``
+                            or its name is empty or contains whitespace
+                            (also right before the ``":"`` — what
+                            :rfc:`9112` tells a parser to reject); if a
+                            name or value contains a CR, an LF or a NUL
+        :raises TypeError: if a value is bytes, or an item of an iterable
+                           is a string instead of a name/value tuple
         """
         self._lines: list[tuple[str, str]] = []
 
@@ -122,13 +241,16 @@ class Headers(MutableMapping[str, str]):
             self._lines = list(headers._lines)
 
         elif isinstance(headers, str):
-            for line in headers.splitlines():
+            for line in _LINE_END.split(headers):
                 if not line.strip():
                     continue
                 name, sep, value = line.partition(":")
-                if not sep or not name.strip():
+                # no whitespace anywhere in the name: "Name : value" is a
+                # request smuggling vector, a leading blank is line
+                # folding, and "GET http://x/ HTTP/1.1" is not a field
+                if not sep or not name or any(char.isspace() for char in name):
                     raise ValueError(f"invalid header line: {line!r}")
-                self.add(name.strip(), value.strip(" \t"))
+                self.add(name, value.strip(" \t"))
 
         elif isinstance(headers, Mapping):
             # cast: the type checker cannot fully rule out the Iterable-of-tuples
@@ -138,7 +260,15 @@ class Headers(MutableMapping[str, str]):
                 self.add(name, value_s)
 
         elif isinstance(headers, Iterable):
-            for name, value_s in headers:
+            for item in headers:
+                if isinstance(item, (str, bytes)):
+                    # a two-character string would unpack into a name and
+                    # a value: ["ab"] is not the header "a: b"
+                    raise TypeError(
+                        "expected (name, value) tuples as the items of the headers, "
+                        f"got the {type(item).__name__} {item!r}"
+                    )
+                name, value_s = item
                 self.add(name, value_s)
 
     def __getitem__(self, name: str) -> str:
@@ -207,7 +337,7 @@ class Headers(MutableMapping[str, str]):
     def get_all(self, name: str) -> list[str]:
         """
         The values of all lines of the field, in representation order; use
-        ``headers[name]`` or :py:meth:`get` for the single-value view and
+        ``headers[name]`` or ``headers.get(name)`` for the single-value view and
         :py:meth:`get_values` for the comma-split element view.
 
         :param name: the field name (case-insensitive)
@@ -221,11 +351,19 @@ class Headers(MutableMapping[str, str]):
         """
         The elements of all lines of the field: like :py:meth:`get_all`,
         but each line is additionally split on ``","`` (:rfc:`9110` list
-        syntax) with whitespace stripped and empty elements dropped.
+        syntax) with whitespace stripped and empty elements dropped. A
+        comma inside a quoted string is not a separator::
 
-        WARNING: ``Set-Cookie`` does not use the list syntax — its values
-        may contain literal commas (e.g. in an ``Expires`` attribute), so
-        use :py:meth:`get_all` for it.
+            >>> headers = Headers('Cache-Control: private="a, b", max-age=60')
+            >>> headers.get_values("Cache-Control")
+            ['private="a, b"', 'max-age=60']
+
+        WARNING: only fields defined as lists can be split. ``Set-Cookie``
+        is not one, and neither are the fields holding a date (``Date``,
+        ``Expires``, ``Last-Modified``, ``If-Modified-Since``, ...): their
+        values contain literal commas (``Thu, 01 Dec 1994 ...``), so use
+        :py:meth:`get_all` for them. A URL in angle brackets (``Link``)
+        may contain commas as well.
 
         :param name: the field name (case-insensitive)
         :return: the elements as a list, an empty list if the field does
@@ -234,7 +372,7 @@ class Headers(MutableMapping[str, str]):
         return [
             element.strip(" \t")
             for line in self.get_all(name)
-            for element in line.split(",")
+            for element in _split_elements(line)
             if element.strip(" \t")
         ]
 
@@ -245,8 +383,11 @@ class Headers(MutableMapping[str, str]):
 
         :param name: the field name to add (stored in the given casing)
         :param value: the value or list of values to add (one line each)
+        :raises ValueError: if the name or a value contains a CR, an LF
+                            or a NUL
+        :raises TypeError: if the name is not a string or a value is bytes
         """
-        self._lines.extend((name, value_) for value_ in _coerce_values(value))
+        self._lines.extend(_lines(name, value))
 
     def remove(
         self, name: str, value: Union[HeaderValue, Iterable[HeaderValue], None] = None
@@ -285,9 +426,12 @@ class Headers(MutableMapping[str, str]):
         :param name: the field name (matched case-insensitively, stored in
                      the given casing)
         :param value: a single value or a list of values (one line each)
+        :raises ValueError: if the name or a value contains a CR, an LF
+                            or a NUL
+        :raises TypeError: if the name is not a string or a value is bytes
         """
-        values = _coerce_values(value)
-        if not values:
+        lines = _lines(name, value)
+        if not lines:
             self.remove(name)
             return
 
@@ -299,12 +443,12 @@ class Headers(MutableMapping[str, str]):
                 # replace the first line of the field with the new lines,
                 # drop the others
                 if not inserted:
-                    new_lines.extend((name, value_) for value_ in values)
+                    new_lines.extend(lines)
                     inserted = True
             else:
                 new_lines.append((line_name, line_value))
         if not inserted:
-            new_lines.extend((name, value_) for value_ in values)
+            new_lines.extend(lines)
         self._lines = new_lines
 
     # narrower than the MutableMapping contract on purpose: update() accepts
@@ -340,11 +484,18 @@ class Headers(MutableMapping[str, str]):
         self._lines = []
         return old
 
-    def copy(self) -> "Headers":
+    def copy(self) -> Self:
         """
-        :return: a new Headers instance with a copy of the lines
+        :return: a new instance of the same class with a copy of the
+                 lines — and of everything else set on this instance, so
+                 a :py:attr:`secret_names` of its own keeps redacting
         """
-        return Headers(self)
+        # not through the constructor: a subclass may have another
+        # signature, and attributes set on the instance would be lost
+        duplicate = self.__class__.__new__(self.__class__)
+        duplicate.__dict__.update(self.__dict__)
+        duplicate._lines = list(self._lines)
+        return duplicate
 
     def sort(self) -> None:
         """
@@ -415,7 +566,9 @@ class Headers(MutableMapping[str, str]):
         Headers are equal when they hold the same fields with the same
         values in the same per-field order; the order of different fields
         and the casing of the names don't matter. Plain mappings are
-        converted to Headers before comparing.
+        converted to Headers before comparing; one that cannot be headers
+        (a key that is not a string, a value that is ``None``, ...) is
+        simply not equal.
 
         :param other: the Headers instance or mapping to compare with
         :return: whether the headers are equal
@@ -423,9 +576,15 @@ class Headers(MutableMapping[str, str]):
         if isinstance(other, Headers):
             return self._folded() == other._folded()
         if isinstance(other, Mapping):
-            # cast: the values of an arbitrary mapping are unknown to the
-            # type checker; non-string values are coerced like everywhere else
-            return self._folded() == Headers(cast("HeaderTypes", other))._folded()
+            try:
+                # cast: the values of an arbitrary mapping are unknown to
+                # the type checker; non-string values are coerced like
+                # everywhere else
+                converted = Headers(cast("HeaderTypes", other))
+            except (TypeError, ValueError):
+                # a comparison answers, it does not raise
+                return False
+            return self._folded() == converted._folded()
         return NotImplemented
 
     def __repr__(self) -> str:
@@ -442,13 +601,28 @@ class Headers(MutableMapping[str, str]):
         return f"{self.__class__.__name__}({rendered})"
 
 
+def _own_headers(headers: Union[HeaderTypes, None]) -> Headers:
+    """
+    The headers a request or response keeps for what it was given: always
+    an instance of its own, never the caller's.
+
+    :param headers: the headers as given, in any accepted form
+    :return: a copy of a Headers instance — of the same class, with the
+             same :py:attr:`~Headers.secret_names` —, a new Headers
+             instance for everything else
+    """
+    if isinstance(headers, Headers):
+        return headers.copy()
+    return Headers(headers)
+
+
 class Header(StrEnum):
     """
     The known HTTP header field names as string constants.
 
     The members are the field names from the `IANA HTTP field name registry
     <https://www.iana.org/assignments/http-fields/>`_ — all ``permanent``,
-    ``deprecated`` and ``provisional`` registrations as of 2026-08-07
+    ``deprecated`` and ``provisional`` registrations as of 2026-11-26
     (``obsoleted`` ones are left out) — plus a handful of widely used
     de-facto standard ``X-…`` names that were never registered.
 
@@ -518,6 +692,7 @@ class Header(StrEnum):
     CLOSE = "Close"
     CONCEALED_AUTH_EXPORT = "Concealed-Auth-Export"
     CONNECTION = "Connection"
+    CONNECT_UDP_BIND = "Connect-UDP-Bind"
     CONTENT_DIGEST = "Content-Digest"
     CONTENT_DISPOSITION = "Content-Disposition"
     CONTENT_ENCODING = "Content-Encoding"
@@ -577,6 +752,7 @@ class Header(StrEnum):
     MIME_VERSION = "MIME-Version"
     NEGOTIATE = "Negotiate"
     NEL = "NEL"
+    NO_VARY_SEARCH = "No-Vary-Search"
     ODATA_ENTITYID = "OData-EntityId"
     ODATA_ISOLATION = "OData-Isolation"
     ODATA_MAXVERSION = "OData-MaxVersion"
@@ -597,6 +773,7 @@ class Header(StrEnum):
     PROXY_AUTHENTICATE = "Proxy-Authenticate"
     PROXY_AUTHENTICATION_INFO = "Proxy-Authentication-Info"
     PROXY_AUTHORIZATION = "Proxy-Authorization"
+    PROXY_PUBLIC_ADDRESS = "Proxy-Public-Address"
     PROXY_STATUS = "Proxy-Status"
     PUBLIC_KEY_PINS = "Public-Key-Pins"
     PUBLIC_KEY_PINS_REPORT_ONLY = "Public-Key-Pins-Report-Only"

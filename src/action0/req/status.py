@@ -9,7 +9,7 @@ class Status(IntEnum):
 
     The members are the codes from the `IANA HTTP status code registry
     <https://www.iana.org/assignments/http-status-codes/>`_ as of
-    2026-08-07 with their registered reason phrases, plus the well-known
+    2026-11-26 with their registered reason phrases, plus the well-known
     ``418 I'm a Teapot`` from :rfc:`2324`. Being an
     :py:class:`enum.IntEnum`, every member *is* its numeric code:
 

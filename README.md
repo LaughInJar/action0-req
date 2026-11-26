@@ -29,8 +29,9 @@ pip install action0-req  # or uv add action0-req
 ## Usage
 
 `Header`, `Status` and `Method` are `StrEnum`/`IntEnum` constants for the
-IANA-registered header field names, status codes and request methods —
-every member *is* its string or integer value:
+IANA-registered header field names and status codes and for the request
+methods of RFC 9110 (plus `PATCH` and `QUERY`) — every member *is* its
+string or integer value:
 
 ```python
 from action0.req import Header, Method, Status
@@ -63,9 +64,13 @@ print(headers.as_str(separator="\n"))  # "\r\n" by default
 print(Headers({"Authorization": "Bearer tok"}))  # Headers(Authorization: ***)
 ```
 
+A name or value containing a line break is refused with a `ValueError`,
+so a value from user input cannot smuggle in a header of its own.
+
 `Request` combines a method, a `Url` (from action0-url), `Headers`, a
-`meta` dict for application metadata (never on the wire) and a body (`bytes`, `str` or a streaming `BodyProducer` — retrievable in any
-of the three forms):
+`meta` dict for application metadata (never on the wire) and a body
+(`bytes`, `str` or a streaming `BodyProducer` — retrievable in any of
+the three forms, synchronously or with `abody_bytes()` / `abody_str()`):
 
 ```python
 from action0.req import Request
@@ -86,6 +91,17 @@ signed = Request("https://api.example.com/a%2Fb?sig=x%2By&flag")
 print(signed.as_str(separator="\n"))
 # GET /a%2Fb?sig=x%2By&flag HTTP/1.1
 # Host: api.example.com
+print(signed)  # repr() redacts secret query parameters and the password
+# Request(GET https://api.example.com/a%2Fb?sig=***&flag)
+
+# the target forms a URL cannot express are set explicitly
+print(Request("https://example.com", "OPTIONS", target="*").as_str(separator="\n"))
+# OPTIONS * HTTP/1.1
+# Host: example.com
+
+# and from_str() parses what as_str() renders
+parsed = Request.from_str("GET /items?page=2 HTTP/1.1\nHost: api.example.com", scheme="https")
+print(parsed.url)  # https://api.example.com/items?page=2
 ```
 
 `Response` mirrors it for the server side — status (with reason phrase
@@ -99,11 +115,14 @@ print(resp.phrase, resp.is_client_error)  # Not Found True
 print(resp.as_str(separator="\n"))  # "\r\n" by default
 # HTTP/1.1 404 Not Found
 # Content-Type: text/plain
+print(Response.from_str("HTTP/1.1 204 No Content\nETag: abc").headers["ETag"])  # abc
 ```
 
 A response body can also be read as a seekable file object and copied
 into a file, and a response releases what its body holds (a connection,
-a temporary file) when closed:
+a temporary file) when closed. A streamed body can be read once — a
+second read raises instead of coming back empty —, and `body_file()`
+(`abody_file()` in asynchronous code) is what keeps it readable:
 
 ```python
 import gzip
@@ -116,6 +135,7 @@ with Response(200, body=IterableBody([compressed[:8], compressed[8:]])) as resp:
     print(gzip.GzipFile(fileobj=resp.body_file()).read())  # b'a large report'
     written = resp.save_body("report.gz")  # a path or an open binary file
     print(written == len(compressed))  # True
+    print(resp.body_bytes() == compressed)  # True
 ```
 
 ## Development
@@ -130,7 +150,7 @@ uv run ruff format   # format
 uv run mypy          # type-check (also: uv run pyright, uv run ty check)
 
 # build the docs (Sphinx; deployed to GitHub Pages on push to main)
-uv run --group docs sphinx-build -W docs docs/_build/html
+uv run --group docs sphinx-build -W --keep-going -b html docs docs/_build/html
 ```
 
 ### Releasing

@@ -47,7 +47,7 @@ docs = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "action0-url", specifier = ">=0.2.0" }]
+requires-dist = [{ name = "action0-url", specifier = ">=0.2.0,<0.3" }]
 
 [package.metadata.requires-dev]
 dev = [
