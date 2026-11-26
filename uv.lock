@@ -47,7 +47,7 @@ docs = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "action0-url", specifier = ">=0.2.0,<0.3" }]
+requires-dist = [{ name = "action0-url", specifier = ">=0.2.1,<0.3" }]
 
 [package.metadata.requires-dev]
 dev = [
@@ -69,11 +69,11 @@ docs = [
 
 [[package]]
 name = "action0-url"
-version = "0.2.0"
+version = "0.2.1"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/ae/2d/947f2444f6900cf6ee2e55f088408e02e48d33db47dc005855155e709611/action0_url-0.2.0.tar.gz", hash = "sha256:18655e97a3f58466730ef08dcd134544d0be4f9f85b6cff9d73dd8db71af5430", size = 66736, upload-time = "2026-11-26T13:55:31.572Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/da/46/0ea01759640060aa2bf440dc034503c27f709e7f72408ad2e101c12a1cf5/action0_url-0.2.1.tar.gz", hash = "sha256:cf07ebd4824d5327f9902c042678dfd9eebe4ec3f59c7ed3b58942b73d213b66", size = 69898, upload-time = "2026-11-26T16:27:14.979Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/3e/91/5b955a3768339dc1b0f69307af6e1e0dafb76ba4fbcfaaed96ace9863d7b/action0_url-0.2.0-py3-none-any.whl", hash = "sha256:f008b379611d2cb303291efed9550eacf29a3e8b714262421eba1bbc87e26773", size = 30640, upload-time = "2026-11-26T13:55:30.57Z" },
+    { url = "https://files.pythonhosted.org/packages/1c/ab/18d336f5e8fe39904e6476d3cfb9167ad0dff660560528105b9dba0d96b9/action0_url-0.2.1-py3-none-any.whl", hash = "sha256:3a98f9ccb8f2049c0c07d8dc988c8d3901550208cd97ae4199b6632ce3ace0f1", size = 31385, upload-time = "2026-11-26T16:27:13.714Z" },
 ]
 
 [[package]]
