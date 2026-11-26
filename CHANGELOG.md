@@ -144,10 +144,12 @@ Behaviour that code may rely on:
 
 And from the dependency:
 
-- **action0-url 0.2.0 is required** (was 0.1.0), and the requirement is
+- **action0-url 0.2.1 is required** (was 0.1.0), and the requirement is
   capped below 0.3: a minor release of a 0.x package may change
-  behaviour, as this one did. Its changes show through
-  wherever a request has a URL; see the
+  behaviour, as 0.2.0 did. (0.2.1 adds `Url.request_target` and
+  `Url.raw_authority`, which `Request.as_str()` takes the request target
+  and the `Host` header from; it changes nothing else.) The changes of
+  0.2.0 show through wherever a request has a URL; see the
   [action0-url changelog](https://github.com/LaughInJar/action0-url/blob/main/CHANGELOG.md)
   for all of them. What you will notice in requests:
   - **No default scheme.** `Request("example.com/items")` used to become

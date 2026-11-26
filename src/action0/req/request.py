@@ -33,57 +33,6 @@ from .headers import HeaderTypes
 from .headers import _check_token
 from .headers import _own_headers
 
-# hostname of the placeholder authority a URL is rendered behind to read off
-# its request target, see _request_target()
-_ANCHOR = "x"
-
-
-def _request_target(url: Url) -> str:
-    """
-    The origin-form request target of a URL (:rfc:`9112`, section 3.2.1):
-    the path (with its path params) and the query, spelled exactly as
-    ``url.as_str()`` spells them — so the percent escapes of a signed URL
-    arrive on the wire unchanged.
-
-    :param url: the URL of the request
-    :return: the target, always starting with a "/"
-    """
-    # The Url renders its own path; rebuilding it from the decoded ``path``
-    # would lose the escapes ("/a%2Fb" -> "/a/b"). Behind an authority the
-    # path is written as it is, whereas a URL without one gets its path
-    # prefixed where it would be read as a host or a scheme ("//x" ->
-    # "/.//x"), hence the placeholder; userinfo and fragment are not part
-    # of the target.
-    anchored = url.copy(authority=_ANCHOR, username=None, password=None, fragment=None)
-    # a scheme cannot contain a "/", so this is the placeholder authority
-    target = anchored.as_str().partition(f"//{_ANCHOR}")[2]
-    # an empty path: "" or just "?query"
-    return target if target.startswith("/") else f"/{target}"
-
-
-def _host(url: Url) -> str:
-    """
-    The value of the ``Host`` header for a URL: hostname and port as they
-    are written in the URL string — a non-ASCII hostname IDNA-encoded, an
-    IPv6 address in brackets. ``url.authority`` is the readable form and
-    not what goes on the wire.
-
-    :param url: the URL of the request
-    :return: e.g. ``"example.com:8443"``, "" for a URL without a hostname
-    """
-    authority = url.copy(
-        scheme=None,
-        username=None,
-        password=None,
-        path=None,
-        path_params=None,
-        query=None,
-        fragment=None,
-    ).as_str()
-    # "//host:port", or "" for a URL without an authority
-    return authority[2:]
-
-
 # the blank line between the head of a message and its body: two line ends
 # (see _LINE_END) — CRLF as on the wire, or a bare LF
 _BLANK_LINE = re.compile(r"\r?\n\r?\n")
@@ -443,7 +392,7 @@ class Request:
             # read as a host
             anchored = bool(host) or target.startswith("//")
             url = Url(f"//{host}{target}" if anchored else target)
-            if _request_target(url) != target:
+            if url.request_target != target:
                 # a spelling the Url does not keep: what was written wins
                 explicit = target
         else:
@@ -693,12 +642,14 @@ class Request:
         :raises TypeError: if the body is a ``bytearray`` or a
                            ``memoryview`` (with ``include_body``)
         """
-        target = self.target if self.target is not None else _request_target(self.url)
+        target = self.target if self.target is not None else self.url.request_target
         _check_token(self.method, "method")
         _check_token(target, "request target")
         _check_token(self.http_version, "HTTP version")
         lines = [f"{self.method} {target} {self.http_version}"]
-        host = _host(self.url)
+        # hostname and port as the URL string has them: IDNA-encoded, an
+        # IPv6 address in brackets — url.authority is the readable form
+        host = self.url.raw_authority
         if Header.HOST not in self.headers and host:
             lines.append(f"Host: {host}")
         if self.headers:
