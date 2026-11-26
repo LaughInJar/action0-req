@@ -1,4 +1,5 @@
 import unittest
+from typing import Any
 
 from action0.req import BytesBody
 from action0.req import Headers
@@ -50,6 +51,69 @@ class RequestInitTestCase(unittest.TestCase):
         """
         req = Request("https://api.example.com/items?page=1", query={"q": "x"})
         self.assertEqual(req.url.as_str(), "https://api.example.com/items?q=x")
+
+    def test_query_kwarg_none_keeps_url_query(self) -> None:
+        """
+        Test that query=None means "not given" and keeps the query of the
+        URL — unlike the Url constructor, which removes it — while an
+        empty mapping or string removes it.
+        """
+        url = "https://api.example.com/items?page=1"
+        self.assertEqual(Request(url, query=None).url.as_str(), url)
+        self.assertEqual(Url(url, query=None).as_str(), "https://api.example.com/items")
+        self.assertEqual(Request(url, query={}).url.as_str(), "https://api.example.com/items")
+        self.assertEqual(Request(url, query="").url.as_str(), "https://api.example.com/items")
+
+    def test_query_kwarg_string_is_read_like_the_url_reads_it(self) -> None:
+        """
+        Test that a query string is parsed with the encoding of the URL's
+        scheme, like the Url constructor does: form-encoded ("+" is a
+        space) for the web schemes only.
+        """
+        web = Request("https://api.example.com/items", query="q=a+b")
+        self.assertEqual(web.url.query["q"], "a b")
+        other = Request("myapp://host/items", query="q=a+b")
+        self.assertEqual(other.url.query["q"], "a+b")
+        self.assertEqual(other.url.query, Url("myapp://host/items", query="q=a+b").query)
+
+    def test_query_kwarg_is_copied(self) -> None:
+        """
+        Test that a Params instance given as query is not shared with the
+        request's URL.
+        """
+        params = Url("https://api.example.com/?a=1").query
+        req = Request("https://api.example.com/items", query=params)
+        req.url.query["a"] = "2"
+        self.assertEqual(params["a"], "1")
+
+    def test_query_kwarg_invalid_value(self) -> None:
+        """
+        Test that a parameter value the URL cannot hold is rejected.
+        """
+        # typed as Any: the type checkers would refuse the value already
+        query: Any = {"a": None}
+        with self.assertRaises(TypeError):
+            Request("https://api.example.com/items", query=query)
+
+    def test_no_default_scheme(self) -> None:
+        """
+        Test that nothing is assumed about a URL string without a scheme:
+        it stays a relative reference.
+        """
+        req = Request("example.com/items")
+        self.assertEqual(req.url.scheme, "")
+        self.assertIsNone(req.url.hostname)
+        self.assertEqual(req.url.as_str(), "example.com/items")
+        self.assertEqual(Request("/items?page=1").url.as_str(), "/items?page=1")
+
+    def test_url_is_kept_as_written(self) -> None:
+        """
+        Test that the percent escapes and the spelling of the query of the
+        given URL are preserved.
+        """
+        url = "https://api.example.com/a%2Fb/%7Ec?sig=x%2By%3D&flag&q=a%20b"
+        self.assertEqual(Request(url).url.as_str(), url)
+        self.assertEqual(Request(Url(url)).url.as_str(), url)
 
     def test_method_uppercased(self) -> None:
         """
@@ -165,6 +229,139 @@ class RequestAsStrTestCase(unittest.TestCase):
         req = Request("https://api.example.com")
         self.assertEqual(req.as_str(), "GET / HTTP/1.1\r\nHost: api.example.com")
 
+    def test_target_is_spelled_like_the_url(self) -> None:
+        """
+        Test that the target is the URL's own rendering of path, path
+        params and query: escapes are neither decoded nor re-encoded.
+        """
+        cases = {
+            # an escaped "/" is not a segment separator
+            "https://e.com/a%2Fb/c": "/a%2Fb/c",
+            # unreserved characters stay escaped, invalid UTF-8 stays as it is
+            "https://e.com/%7Euser/%e4": "/%7Euser/%e4",
+            # the query of a signed URL: escapes, "%20" and a flag without "="
+            "https://e.com/x?sig=a%2Bb%3D&flag&q=a%20b&&c=d+e": (
+                "/x?sig=a%2Bb%3D&flag&q=a%20b&&c=d+e"
+            ),
+            # path params, also on an inner segment
+            "https://e.com/a;v=1/b;w=2?q=1": "/a;v=1/b;w=2?q=1",
+            # an empty first segment must not be prefixed ("/.//")
+            "https://e.com//double/slash": "//double/slash",
+            "https://e.com/a:b": "/a:b",
+            # characters that cannot be in a URL are encoded by the Url
+            "https://e.com/a b/ü?q=ü": "/a%20b/%C3%BC?q=%C3%BC",
+            # a "+" in the query of a scheme without form encoding
+            "myapp://e.com/x?a=b+c%20d": "/x?a=b+c%20d",
+        }
+        for url, target in cases.items():
+            with self.subTest(url=url):
+                req = Request(url)
+                self.assertEqual(req.as_str(), f"GET {target} HTTP/1.1\r\nHost: e.com")
+                # ... which is what the URL itself shows behind the authority
+                self.assertTrue(req.url.as_str().endswith(f"e.com{target}"))
+
+    def test_target_of_modified_url(self) -> None:
+        """
+        Test that the target follows modifications of the URL, encoded the
+        way the Url encodes them.
+        """
+        req = Request("https://e.com/x?sig=a%2Bb&flag")
+        req.url.query["n"] = "a b"
+        self.assertEqual(req.as_str(), "GET /x?sig=a%2Bb&flag=&n=a+b HTTP/1.1\r\nHost: e.com")
+        req.url.path = "/my file;v1"
+        req.url.query = None
+        # a ";" in the last segment would start the path params
+        self.assertEqual(req.url.as_str(), "https://e.com/my%20file%3Bv1")
+        self.assertEqual(req.as_str(), "GET /my%20file%3Bv1 HTTP/1.1\r\nHost: e.com")
+
+    def test_target_is_an_absolute_path(self) -> None:
+        """
+        Test that the target always starts with a "/": for an empty path
+        (with and without a query) and for a relative one.
+        """
+        cases = {
+            "https://e.com?x=1": "GET /?x=1 HTTP/1.1\r\nHost: e.com",
+            "https://e.com/?": "GET / HTTP/1.1\r\nHost: e.com",
+            "": "GET / HTTP/1.1",
+            "/items?page=1": "GET /items?page=1 HTTP/1.1",
+            "items/5": "GET /items/5 HTTP/1.1",
+            "//double/slash": "GET /slash HTTP/1.1\r\nHost: double",
+        }
+        for url, rendered in cases.items():
+            with self.subTest(url=url):
+                self.assertEqual(Request(url).as_str(), rendered)
+
+    def test_target_of_url_without_host(self) -> None:
+        """
+        Test that the path of a URL without a host is not prefixed the way
+        the URL string has to be to round-trip.
+        """
+        req = Request()
+        req.url.path = "//double/slash"
+        self.assertEqual(req.url.as_str(), "/.//double/slash")
+        self.assertEqual(req.as_str(), "GET //double/slash HTTP/1.1")
+        req.url.path = "a:b"
+        self.assertEqual(req.url.as_str(), "./a:b")
+        self.assertEqual(req.as_str(), "GET /a:b HTTP/1.1")
+
+    def test_target_has_no_userinfo_and_fragment(self) -> None:
+        """
+        Test that neither the credentials nor the fragment of the URL end
+        up in the request line or the Host header.
+        """
+        req = Request("https://user:secret@e.com:8443/x?a=1#frag")
+        self.assertEqual(req.as_str(), "GET /x?a=1 HTTP/1.1\r\nHost: e.com:8443")
+
+    def test_host_is_idna_encoded(self) -> None:
+        """
+        Test that a non-ASCII hostname is IDNA-encoded in the Host header,
+        as in the URL string.
+        """
+        req = Request("https://bücher.example:8443/x")
+        self.assertEqual(req.url.authority, "bücher.example:8443")
+        self.assertEqual(req.as_str(), "GET /x HTTP/1.1\r\nHost: xn--bcher-kva.example:8443")
+
+    def test_host_ipv6_in_brackets(self) -> None:
+        """
+        Test that an IPv6 address keeps its brackets in the Host header.
+        """
+        self.assertEqual(Request("http://[::1]/x").as_str(), "GET /x HTTP/1.1\r\nHost: [::1]")
+        self.assertEqual(
+            Request("http://[::1]:8080/x").as_str(), "GET /x HTTP/1.1\r\nHost: [::1]:8080"
+        )
+
+    def test_no_host_without_hostname(self) -> None:
+        """
+        Test that no Host header is derived from a URL without an
+        authority or with an empty one.
+        """
+        for url in ("/items", "items", "sqlite:///data.db", "https://user:secret@/x"):
+            with self.subTest(url=url):
+                self.assertNotIn("Host", Request(url).as_str())
+
+    def test_as_str_does_not_modify_url(self) -> None:
+        """
+        Test that rendering leaves the request's URL untouched.
+        """
+        url = "https://user:secret@e.com/a%2Fb;p=1?flag#frag"
+        req = Request(url)
+        req.as_str()
+        self.assertEqual(req.url.as_str(), url)
+
+    def test_url_subclass(self) -> None:
+        """
+        Test that a Url subclass with a constructor of its own can be
+        rendered.
+        """
+
+        class ApiUrl(Url):
+            def __init__(self, resource: str) -> None:
+                super().__init__(f"https://api.example.com/v1/{resource}")
+
+        req = Request(ApiUrl("items"))
+        self.assertIsInstance(req.url, ApiUrl)
+        self.assertEqual(req.as_str(), "GET /v1/items HTTP/1.1\r\nHost: api.example.com")
+
     def test_include_body(self) -> None:
         """
         Test that include_body appends a blank line and the text body.
@@ -235,6 +432,26 @@ class RequestCopyEqReprTestCase(unittest.TestCase):
         self.assertNotEqual(Request(body=b"x"), Request(body="x"))
         self.assertNotEqual(Request(method="GET"), Request(method="POST"))
         self.assertNotEqual(Request(), "GET  HTTP/1.1")
+
+    def test_eq_compares_equivalent_urls(self) -> None:
+        """
+        Test that requests are equal when their URLs are equivalent, not
+        when the decoded parts happen to match.
+        """
+        self.assertEqual(Request("https://E.com/%7Ea"), Request("https://e.com/~a"))
+        self.assertEqual(Request("https://e.com?a=b%20c"), Request("https://e.com?a=b+c"))
+        # an escaped "/" is part of a segment, a raw one separates segments
+        self.assertNotEqual(Request("https://e.com/a%2Fb"), Request("https://e.com/a/b"))
+        self.assertNotEqual(Request("//e.com/a"), Request("https://e.com/a"))
+
+    def test_copy_keeps_url_as_written(self) -> None:
+        """
+        Test that a copy has the URL in the same spelling.
+        """
+        url = "https://user:secret@e.com/a%2Fb?sig=x%2By&flag"
+        clone = Request(url).copy(method="POST")
+        self.assertEqual(clone.url.as_str(), url)
+        self.assertEqual(clone.as_str(), "POST /a%2Fb?sig=x%2By&flag HTTP/1.1\r\nHost: e.com")
 
     def test_repr_redacts_url_password(self) -> None:
         """
