@@ -10,7 +10,9 @@ license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
-    "action0-url>=0.2.0",
+    # capped below the next minor: action0-url is 0.x, where a minor
+    # release may change behaviour (as 0.2.0 did)
+    "action0-url>=0.2.0,<0.3",
 ]
 keywords = ["http", "request", "response", "headers", "status", "manipulation"]
 classifiers = [
@@ -120,9 +122,6 @@ docstring-code-format = true
 # This only has an effect when the `docstring-code-format` setting is
 # enabled.
 docstring-code-line-length = 99
-
-[tool.ruff.lint.pydocstyle]
-convention = "pep257"
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "src"]

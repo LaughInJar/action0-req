@@ -104,8 +104,11 @@ print(headers.as_str(separator="\n"))
 ```
 
 `get_values()` splits the lines into their comma-separated elements
-(RFC 9110 list syntax — don't use it for `Set-Cookie`, whose values can
-contain literal commas):
+(RFC 9110 list syntax); a comma inside a quoted string is not a
+separator. Use it only for fields that are lists: `Set-Cookie` is not
+one, and neither are the date fields (`Date`, `Expires`,
+`Last-Modified`, …), whose values contain literal commas — `get_all()`
+is for those:
 
 ```python
 from action0.req import Headers
@@ -113,13 +116,38 @@ from action0.req import Headers
 headers = Headers("Vary: Accept-Encoding, Accept-Language\nVary: Cookie")
 print(headers.get_values("vary"))
 # ['Accept-Encoding', 'Accept-Language', 'Cookie']
+headers = Headers('Cache-Control: private="a, b", max-age=60')
+print(headers.get_values("Cache-Control"))
+# ['private="a, b"', 'max-age=60']
+```
+
+A name or value that would break out of its line on the wire — one
+containing a carriage return, a line feed or a NUL — is refused with a
+`ValueError`, whichever way it comes in, so a value taken from user
+input cannot smuggle in a header of its own. A raw header block is
+split at `\r\n` and `\n` only, and a line with whitespace in its name
+(also right before the colon) is not a header line. Bytes are not header
+values and raise a `TypeError`:
+
+```python
+from action0.req import Headers
+
+headers = Headers()
+try:
+    headers.add("X-Trace", "abc\r\nSet-Cookie: admin=1")
+except ValueError as error:
+    print(type(error).__name__)
+    # ValueError
+print(len(headers))
+# 0
 ```
 
 Equality ignores the order of different fields and the casing of names,
 but respects the order of a field's own lines. `repr()` and `str()`
 redact the values of secret fields (`Authorization`, cookies, … — the
-overridable `Headers.secret_names` set); only the wire rendering
-`as_str()` keeps them:
+`Headers.secret_names` set, which can be overridden on a subclass or an
+instance; copies, and the requests and responses the headers are handed
+to, keep the override); only the wire rendering `as_str()` keeps them:
 
 ```python
 from action0.req import Headers
@@ -143,7 +171,8 @@ attribute (the URL a {py:class}`~action0.url.base.Url` from
 {py:class}`~action0.req.headers.Headers`). The URL can be passed as a
 string or an existing `Url` (which is copied); `query` replaces the URL's
 query like the `Url` constructor does (`None`, the default, leaves it
-alone; an empty mapping removes it); the method is uppercased:
+alone; an empty mapping removes it); the method is uppercased, also when
+it is assigned later:
 
 ```python
 from action0.req import Request
@@ -196,16 +225,61 @@ print(req.as_str())
 # GET /example.com/items HTTP/1.1
 ```
 
-`copy()` returns an independent request, with keyword overrides for any
-constructor argument:
+The target `as_str()` derives is the origin-form, path and query. The
+other forms of a request target cannot be read off a URL, so they are
+set explicitly with `target`: `"*"` for a server-wide `OPTIONS`,
+`"host:port"` for `CONNECT`, the absolute URL for a request sent to a
+proxy:
 
 ```python
 from action0.req import Request
 
-req = Request("https://user:secret@api.example.com/items")
-clone = req.copy(method="POST", query={"id": 7})
+req = Request("https://example.com", "OPTIONS", target="*")
+print(req.as_str(separator="\n"))
+# OPTIONS * HTTP/1.1
+# Host: example.com
+req = Request("//example.com:443", "CONNECT", target="example.com:443")
+print(req.as_str(separator="\n"))
+# CONNECT example.com:443 HTTP/1.1
+# Host: example.com:443
+```
+
+`copy()` returns an independent request (of the same class), with
+keyword overrides for any constructor argument. `repr()` redacts the
+password of the URL and the values of the query parameters that carry
+secrets (`api_key`, `token`, `signature`, … — the overridable
+`Request.secret_params` set); the URL itself and `as_str()` keep them:
+
+```python
+from action0.req import Request
+
+req = Request("https://user:secret@api.example.com/items?api_key=s3cr3t")
+clone = req.copy(method="POST", query={"id": 7, "token": "abc"})
 print(clone)
-# Request(POST https://user:***@api.example.com/items?id=7)
+# Request(POST https://user:***@api.example.com/items?id=7&token=***)
+print(clone.url)
+# https://user:secret@api.example.com/items?id=7&token=abc
+```
+
+`Request.from_str()` is the inverse of `as_str()`: it parses the request
+line, the header lines and — behind a blank line — the body, which is
+taken as text. The URL is put together from the target and the `Host`
+header; a request does not say which scheme it was sent with, so pass
+`scheme` if you know it. A target that is not a path (`*`, `host:port`,
+an absolute URL) is kept as `target`, and rendering the parsed request
+gives the text back as it was:
+
+```python
+from action0.req import Request
+
+text = "POST /items?page=2 HTTP/1.1\nHost: api.example.com\nAccept: */*\n\nhello"
+req = Request.from_str(text, scheme="https")
+print(req)
+# Request(POST https://api.example.com/items?page=2)
+print(req.headers["Accept"], req.body)
+# */* hello
+print(req.as_str(include_body=True, separator="\n") == text)
+# True
 ```
 
 Both requests and responses carry a `meta` dict for application metadata
@@ -244,6 +318,12 @@ print(req.as_str(include_body=True, separator="\n"))
 #
 # {"a": 1}
 ```
+
+`as_str(include_body=True)` is a rendering for people and never fails
+over the body: bytes that are not text in the charset (a compressed
+body, an image) show with U+FFFD replacement characters. The accessors
+are strict — `body_str()` raises a `UnicodeDecodeError` for such a body,
+and a `LookupError` for a charset Python does not know.
 
 A `BodyProducer` body is streamed in chunks — synchronously via
 `chunks()` or asynchronously via `achunks()`; `as_str(include_body=True)`
@@ -290,8 +370,12 @@ with TemporaryDirectory() as tmp:
 ```
 
 {py:class}`~action0.req.body.IterableBody` wraps any iterable of byte
-chunks — e.g. a generator (then single-use); the length is unknown, such
-a body would be sent chunked:
+chunks — e.g. a generator; the length is unknown, such a body would be
+sent chunked. A body over a generator (or any other iterator) can be
+read **once**: the chunks are gone when they have been delivered.
+Reading it again raises a `RuntimeError` that says so — it does not come
+back empty, which would pass for an empty body. Pass a list of chunks
+for a body that can be read any number of times:
 
 ```python
 from action0.req import IterableBody, Request
@@ -307,16 +391,26 @@ print(req.body_producer().content_length())
 # None
 print(req.body_bytes())  # reads the stream — consumes a generator source
 # b'chunk1chunk2'
+try:
+    req.body_bytes()
+except RuntimeError as error:
+    print(str(error).split(":")[0])
+    # this body has been read already
+
+again = IterableBody([b"chunk1", b"chunk2"])  # a list: re-readable
+print(again.as_bytes() == again.as_bytes())
+# True
 ```
 
 {py:class}`~action0.req.body.AsyncIterableBody` wraps an asynchronous
 iterable — e.g. an async generator proxying another stream. It is
 async-only: the synchronous `chunks()`/`as_bytes()` raise a
-`RuntimeError`. Every producer supports `achunks()` for asynchronous
-consumption (`FileBody` runs its file operations in a worker thread —
-`asyncio.to_thread`, or trio's thread pool below trio — so the event
-loop is never blocked; a source that may block for good, like a named
-pipe nobody writes to, does not stand in the way of a timeout):
+`RuntimeError`, and like a generator an async generator is read once.
+Every producer supports `achunks()` for asynchronous consumption
+(`FileBody` runs its file operations in a worker thread — asyncio's
+default thread pool, or trio's below trio — so the event loop is never
+blocked; a source that may block for good, like a named pipe nobody
+writes to, does not stand in the way of a timeout):
 
 ```python
 import asyncio
@@ -335,6 +429,58 @@ async def main():
 
 print(asyncio.run(main()))
 # [b'async', b'chunks']
+```
+
+A request or response reads such a body with `abody_bytes()` and
+`abody_str()`, the asynchronous twins of `body_bytes()` and `body_str()`
+— they read any producer through its `achunks()`:
+
+```python
+import asyncio
+
+from action0.req import AsyncIterableBody, Request
+
+
+async def generate():
+    yield b"async"
+    yield b"chunks"
+
+
+async def main():
+    req = Request("https://api.example.com/upload", "PUT", body=AsyncIterableBody(generate()))
+    return await req.abody_bytes()
+
+
+print(asyncio.run(main()))
+# b'asyncchunks'
+```
+
+`IterableBody.achunks()` reads its (synchronous) iterable where it is
+called: on the event loop. That is right for chunks that are there
+already, but an iterable that blocks while it produces a chunk — reading
+a socket or a file — stalls the loop for as long. Pass `threaded=True`
+for such a source; then every chunk is fetched in a worker thread (and
+the `close` callback runs there too):
+
+```python
+import asyncio
+import time
+
+from action0.req import IterableBody
+
+
+def slow():
+    for chunk in (b"slow", b"chunks"):
+        time.sleep(0.01)  # blocking I/O
+        yield chunk
+
+
+async def main():
+    return [chunk async for chunk in IterableBody(slow(), threaded=True).achunks()]
+
+
+print(asyncio.run(main()))
+# [b'slow', b'chunks']
 ```
 
 ### Releasing a streamed body
@@ -373,6 +519,16 @@ callback releases what it reads from, which is how a stalled read is
 aborted from outside. Without a callback there is nothing that could
 stop the read, and closing raises a `RuntimeError` instead of pretending
 — cancel the reading task.
+
+A reader that is between two chunks when the body is closed does not
+see a quiet end either: its read raises a `RuntimeError`, because what
+it has got may not be the whole body.
+
+A request can hold such a body as well — one that was built but never
+sent, say. {py:meth}`Request.close() <action0.req.request.Request.close>`
+/ {py:meth}`~action0.req.request.Request.aclose` and the request as a
+(sync or async) context manager release it, exactly like a response
+(see *Closing a response* below).
 
 ### Spooled bodies
 
@@ -420,10 +576,15 @@ Read a spooled body once it is complete: a reader ends where the data
 ends at that moment, and cannot tell a body that is still being written
 from a finished one.
 
+If the data cannot be moved to the temporary file — the disk is full —
+the write raises and the body is closed: there is no telling how much
+made it, and a closed body raises on every read instead of handing out
+a part.
+
 In asynchronous code use `awrite()`, `achunks()` and `aclose()` (or
 `async with`). While the data is in memory they run inline; once it is
 in the temporary file every file operation runs in a worker thread
-(`asyncio.to_thread`, or trio's thread pool when running below trio), so
+(asyncio's default thread pool, or trio's when running below trio), so
 the event loop is never blocked. That is one thread hop per `awrite()`
 call — write chunks of tens of kilobytes rather than single bytes.
 `aclose()` removes the temporary file also when the task has been
@@ -471,16 +632,37 @@ print(resp.as_str(include_body=True, separator="\n"))
 ```
 
 An explicitly set reason wins over the registry, and unregistered codes
-simply have no phrase (the category properties still work for them):
+simply have no phrase (the category properties still work for them).
+The status line keeps the space behind the status code then, as its
+grammar requires:
 
 ```python
 from action0.req import Response
 
 print(Response(404, reason="Nope"))
 # Response(404 Nope)
-print(Response(599).as_str())
-# HTTP/1.1 599
+print(repr(Response(599).as_str()))
+# 'HTTP/1.1 599 '
 print(Response(599).is_server_error)
+# True
+```
+
+The status has to be an int; anything else — the string `"404"`, say —
+raises a `TypeError` when it is set, not later in a comparison.
+
+`Response.from_str()` parses the text of a response, as
+`Request.from_str()` does for a request. The phrase of the status line
+becomes the `reason`, and the body behind the blank line is taken as
+text:
+
+```python
+from action0.req import Response
+
+text = "HTTP/1.1 404 Not Found\nContent-Type: text/plain\n\nnot here"
+resp = Response.from_str(text)
+print(resp.status, resp.reason, resp.headers["Content-Type"], resp.body)
+# 404 Not Found text/plain not here
+print(resp.as_str(include_body=True, separator="\n") == text)
 # True
 ```
 
@@ -509,8 +691,10 @@ file it wraps, or opens its path anew for every call — nothing is
 copied, and what you have not closed yourself is closed with the
 response; and a streamed body is read to its end into a new
 `SpooledBody`, which then replaces `resp.body`, so the response stays
-readable. The stream it replaces has delivered everything and is closed,
-which releases its connection:
+readable — any number of times, where the stream could be read only
+once. The stream it replaces has delivered everything and is closed,
+which releases its connection. `max_memory` and `dir` are passed on to
+the `SpooledBody`:
 
 ```python
 import gzip
@@ -532,6 +716,35 @@ with resp:  # closing the response discards the spooled data
 The replacement happens in this response only. A `copy()` made before
 shares the original stream, which is used up afterwards — as it is after
 any other read of a streamed body.
+
+`body_file()` reads the stream synchronously. In asynchronous code
+{py:meth}`~action0.req.response.Response.abody_file` does the same
+without blocking the event loop: it reads through `achunks()`, spools
+with `awrite()` and awaits the stream's `aclose()`. It is also how a
+body that can only be read asynchronously becomes a file:
+
+```python
+import asyncio
+
+from action0.req import AsyncIterableBody, Response
+
+
+async def stream():
+    yield b"chunk1"
+    yield b"chunk2"
+
+
+async def main():
+    async with Response(200, body=AsyncIterableBody(stream())) as resp:
+        file = await resp.abody_file()
+        print(file.read())
+        # b'chunk1chunk2'
+        print(type(resp.body).__name__, await resp.abody_bytes())  # readable again
+        # SpooledBody b'chunk1chunk2'
+
+
+asyncio.run(main())
+```
 
 ### Saving a response body
 
@@ -575,8 +788,9 @@ with TemporaryDirectory() as tmp:
 If the body breaks off midway, the exception passes through and what
 has arrived is in the file — its size is the offset to resume from. A
 path is opened only once the body has delivered its first chunk: a body
-that cannot be read at all (already closed, failing right away) raises
-without creating or truncating the file. If it is the write that fails
+that cannot be read at all (already closed, a stream that has been read
+before, failing right away) raises without creating or truncating the
+file. If it is the write that fails
 (a full disk), the stream is closed, which releases its connection.
 
 {py:meth}`~action0.req.response.Response.asave_body` is the asynchronous
@@ -644,3 +858,7 @@ print(restored == resp, restored.body_bytes())
 The request reference is pickled along. Drop it first
 (`resp.copy(request=None)`) if the request carries credentials that
 should not end up in the store.
+
+A body that holds a resource cannot be pickled: a stream is read once,
+a `SpooledBody` has a temporary file. Read it into memory first
+(`resp.copy(body=resp.body_bytes())`).

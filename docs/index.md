@@ -6,7 +6,7 @@ convenient creation, duplication and manipulation — the companion of
 the URL representation.
 
 ```shell
-uv add action0-req    # not on PyPI yet — install from GitHub for now
+pip install action0-req  # or uv add action0-req
 ```
 
 **Highlights**:
@@ -14,16 +14,18 @@ uv add action0-req    # not on PyPI yet — install from GitHub for now
 - {py:class}`~action0.req.headers.Header`,
   {py:class}`~action0.req.status.Status` and
   {py:class}`~action0.req.request.Method` — `StrEnum`/`IntEnum` constants
-  for the IANA-registered header field names, status codes (with reason
-  phrases and category properties) and request methods.
+  for the IANA-registered header field names and status codes (with
+  reason phrases and category properties) and for the request methods of
+  RFC 9110, plus `PATCH` and `QUERY`.
 - {py:class}`~action0.req.headers.Headers` — an ordered,
   case-insensitive, multi-value aware mapping of HTTP header fields that
-  preserves the representation exactly and redacts secret values in
-  `repr()`.
+  preserves the representation exactly, redacts secret values in
+  `repr()` and refuses names and values that would inject a line.
 - {py:class}`~action0.req.request.Request` — method, URL, headers, body
   and HTTP version as plain attributes, with typed body accessors
-  (`body_bytes()` / `body_str()` / `body_producer()`), `copy()` with
-  overrides and a wire-format `as_str()`.
+  (`body_bytes()` / `body_str()` / `body_producer()`, and their
+  asynchronous twins), `copy()` with overrides, a wire-format `as_str()`
+  and its inverse `from_str()`.
 - {py:class}`~action0.req.response.Response` — status (with reason
   phrase fallback and category properties), headers, body and an
   optional back-reference to the request, mirroring `Request`.

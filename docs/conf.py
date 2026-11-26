@@ -31,6 +31,10 @@ intersphinx_mapping = {
     "action0-url": ("https://laughinjar.github.io/action0-url/", None),
 }
 
+# a cross-reference that leads nowhere is a warning — and with -W, as CI
+# builds, an error — instead of silently plain text
+nitpicky = True
+
 # order the API reference like the source files and merge the rich __init__
 # docstrings into their class documentation
 autodoc_member_order = "bysource"

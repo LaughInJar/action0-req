@@ -6,6 +6,7 @@ The public constants and classes are importable from the package root:
 from action0.req import Header, Headers, Method, Request, Response, Status
 from action0.req import BodyProducer, BytesBody, FileBody, IterableBody, AsyncIterableBody
 from action0.req import SpooledBody, save_body, asave_body
+from action0.req import BodyTypes, HeaderTypes, HeaderValue  # the type aliases
 ```
 
 ## Headers and Header

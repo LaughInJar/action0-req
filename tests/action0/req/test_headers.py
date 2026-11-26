@@ -1,4 +1,7 @@
+import pickle
 import unittest
+from typing import Any
+from typing import cast
 
 from action0.req import Header
 from action0.req import Headers
@@ -374,13 +377,327 @@ class HeaderTestCase(unittest.TestCase):
         """
         Test that the full IANA registry made it into the enum.
         """
-        # 187 permanent + 8 deprecated + 23 provisional + 10 de-facto
-        self.assertEqual(len(Header), 228)
+        # 190 permanent + 8 deprecated + 23 provisional + 10 de-facto
+        self.assertEqual(len(Header), 231)
 
     def test_values_unique(self) -> None:
         """
         Test that no two members share a header name (which would silently
         turn one of them into an alias).
         """
-        values = [member.value for member in Header]
+        # __members__ and not the enum itself: iterating an enum skips
+        # the aliases, which are exactly what this is looking for
+        members = Header.__members__
+        self.assertEqual(len(members), len(Header))
+        values = [member.value for member in members.values()]
         self.assertEqual(len(values), len(set(values)))
+
+
+class HeadersValidationTestCase(unittest.TestCase):
+    """
+    tests for what :py:class:`action0.req.headers.Headers` refuses to
+    take in
+    """
+
+    def test_line_breaks_in_values_are_refused(self) -> None:
+        """
+        Test that a value cannot smuggle in a header line of its own:
+        a CR, an LF or a NUL raises, whichever way the value comes in,
+        and nothing is added.
+        """
+        headers = Headers({"Accept": "*/*"})
+        for value in ("1\r\nSet-Cookie: evil=1", "1\nX: y", "1\rX: y", "a\x00b"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    headers.add("X-A", value)
+                with self.assertRaises(ValueError):
+                    headers.set("X-A", value)
+                with self.assertRaises(ValueError):
+                    headers["X-A"] = value
+                with self.assertRaises(ValueError):
+                    headers.update({"X-A": value})
+                with self.assertRaises(ValueError):
+                    Headers({"X-A": value})
+                with self.assertRaises(ValueError):
+                    Headers([("X-A", ["fine", value])])
+        self.assertEqual(headers.as_str(), "Accept: */*")
+
+    def test_line_breaks_in_names_are_refused(self) -> None:
+        """
+        Test that a field name cannot break out of its line either.
+        """
+        for name in ("X-A: 1\r\nEvil", "X\nY", "X\rY", "X\x00"):
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    Headers([(name, "1")])
+                with self.assertRaises(ValueError):
+                    Headers().set(name, "1")
+
+    def test_error_names_the_field_and_the_character(self) -> None:
+        """
+        Test that the error says which field it is about and what is
+        wrong with the value.
+        """
+        with self.assertRaisesRegex(ValueError, "'X-Trace' contains a line feed"):
+            Headers().add("X-Trace", "a\nb")
+
+    def test_names_must_be_strings(self) -> None:
+        """
+        Test that a name that is not a string raises a TypeError instead
+        of failing later in a lookup.
+        """
+        with self.assertRaises(TypeError):
+            Headers(cast("Any", [(1, "x")]))
+        with self.assertRaises(TypeError):
+            Headers().add(cast("Any", b"X-A"), "x")
+
+    def test_bytes_values_are_refused(self) -> None:
+        """
+        Test that bytes are not taken for a list of values — iterating
+        them gives numbers — and not for a value either.
+        """
+        values: list[Any] = [b"ab", bytearray(b"ab"), memoryview(b"ab")]
+        for value in values:
+            with self.subTest(value=type(value).__name__):
+                with self.assertRaises(TypeError):
+                    Headers({"X": value})
+                with self.assertRaises(TypeError):
+                    Headers().add("X", ["fine", value])
+                with self.assertRaises(TypeError):
+                    Headers("X: ab").remove("X", value)
+
+    def test_string_items_are_refused(self) -> None:
+        """
+        Test that a string among the items of an iterable is not unpacked
+        into a name and a value ("ab" is not the header "a: b").
+        """
+        with self.assertRaises(TypeError):
+            Headers(cast("Any", ["ab", "cd"]))
+        with self.assertRaises(TypeError):
+            Headers(cast("Any", [b"ab"]))
+
+
+class HeadersRawBlockTestCase(unittest.TestCase):
+    """
+    tests for the parsing of a raw header block
+    """
+
+    def test_only_cr_lf_and_lf_end_a_line(self) -> None:
+        """
+        Test that the characters str.splitlines() also takes for line
+        ends are part of the value.
+        """
+        for char in ("\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", " ", " "):
+            with self.subTest(char=repr(char)):
+                headers = Headers(f"X-A: a{char}b\r\nX-B: c\nX-C: d")
+                self.assertEqual(
+                    headers.as_lines(), [("X-A", f"a{char}b"), ("X-B", "c"), ("X-C", "d")]
+                )
+
+    def test_lone_carriage_return_is_refused(self) -> None:
+        """
+        Test that a CR without an LF is neither a line end nor allowed
+        in a value.
+        """
+        with self.assertRaises(ValueError):
+            Headers("A: 1\rB: 2")
+
+    def test_whitespace_in_the_name_is_refused(self) -> None:
+        """
+        Test that a line is not a header line if there is whitespace
+        before the colon, inside the name or ahead of it: the request
+        smuggling vector of RFC 9112, a request line, a folded line.
+        """
+        for block in ("Name : v", "Name\t: v", "GET http://x/ HTTP/1.1", " folded: v", ": v"):
+            with self.subTest(block=block):
+                with self.assertRaises(ValueError):
+                    Headers(f"A: 1\n{block}")
+
+    def test_value_whitespace_is_stripped(self) -> None:
+        """
+        Test that the optional whitespace around a value is not part of
+        it, while the name is taken as written.
+        """
+        self.assertEqual(Headers("A:1\nB: \t 2 \t").as_lines(), [("A", "1"), ("B", "2")])
+
+
+class HeadersGetValuesTestCase(unittest.TestCase):
+    """
+    tests for the list splitting of
+    :py:meth:`action0.req.headers.Headers.get_values`
+    """
+
+    def test_quoted_commas_are_not_separators(self) -> None:
+        """
+        Test that a comma inside a quoted string belongs to its element.
+        """
+        headers = Headers('Cache-Control: private="a,b", max-age=1\nCache-Control: no-store')
+        self.assertEqual(
+            headers.get_values("cache-control"), ['private="a,b"', "max-age=1", "no-store"]
+        )
+
+    def test_escaped_quote_does_not_end_the_string(self) -> None:
+        """
+        Test that a backslash-escaped quote inside a quoted string is
+        not its end.
+        """
+        headers = Headers([("X-List", r'"a\",b", c')])
+        self.assertEqual(headers.get_values("X-List"), [r'"a\",b"', "c"])
+        headers = Headers([("X-List", r'"a\\", b')])
+        self.assertEqual(headers.get_values("X-List"), [r'"a\\"', "b"])
+
+    def test_unclosed_quote_takes_the_rest(self) -> None:
+        """
+        Test that a quote that is never closed does not lose anything:
+        the rest of the line is one element.
+        """
+        self.assertEqual(Headers([("X-List", 'a, "b, c')]).get_values("X-List"), ["a", '"b, c'])
+
+    def test_empty_elements_are_dropped(self) -> None:
+        """
+        Test that empty elements are still dropped.
+        """
+        self.assertEqual(Headers([("X-List", " a ,, b,")]).get_values("X-List"), ["a", "b"])
+
+
+class HeadersCopyTestCase(unittest.TestCase):
+    """
+    tests for what :py:meth:`action0.req.headers.Headers.copy` keeps
+    """
+
+    def test_copy_keeps_the_subclass(self) -> None:
+        """
+        Test that the copy of a subclass is of that subclass, and with
+        it redacts what the subclass redacts.
+        """
+
+        class _Strict(Headers):
+            secret_names = Headers.secret_names | {"x-token"}
+
+        headers = _Strict({"X-Token": "s3cr3t"})
+        duplicate = headers.copy()
+        self.assertIs(type(duplicate), _Strict)
+        self.assertEqual(repr(duplicate), "_Strict(X-Token: ***)")
+
+    def test_copy_keeps_the_secret_names_of_the_instance(self) -> None:
+        """
+        Test that a redaction set assigned to an instance travels with
+        its copies.
+        """
+        headers = Headers({"X-Token": "s3cr3t"})
+        headers.secret_names = headers.secret_names | {"x-token"}
+        self.assertEqual(repr(headers.copy()), "Headers(X-Token: ***)")
+        self.assertEqual(repr(headers.copy().copy()), "Headers(X-Token: ***)")
+
+    def test_copy_does_not_need_the_constructor(self) -> None:
+        """
+        Test that a subclass with a constructor of its own can be
+        copied, and that the lines of the copy are its own.
+        """
+
+        class _Tagged(Headers):
+            def __init__(self, tag: str) -> None:
+                super().__init__()
+                self.tag = tag
+
+        headers = _Tagged("t")
+        headers.add("A", "1")
+        duplicate = headers.copy()
+        duplicate.add("B", "2")
+        self.assertEqual(duplicate.tag, "t")
+        self.assertEqual(headers.as_lines(), [("A", "1")])
+        self.assertEqual(duplicate.as_lines(), [("A", "1"), ("B", "2")])
+
+    def test_pickle_round_trip(self) -> None:
+        """
+        Test that headers survive pickling, with order and casing.
+        """
+        headers = Headers("B: 2\na: 1\nA: 3")
+        restored = pickle.loads(pickle.dumps(headers))
+        self.assertEqual(restored.as_lines(), headers.as_lines())
+
+
+class HeadersMappingMixinTestCase(unittest.TestCase):
+    """
+    tests for the methods :py:class:`action0.req.headers.Headers`
+    inherits from ``MutableMapping``, which work on the single-value view
+    """
+
+    def setUp(self) -> None:
+        self.headers = Headers("A: 1\nB: 2\na: 3")
+
+    def test_views(self) -> None:
+        """
+        Test keys(), values() and items(): one entry per field, with the
+        last value.
+        """
+        self.assertEqual(list(self.headers.keys()), ["A", "B"])
+        self.assertEqual(list(self.headers.values()), ["3", "2"])
+        self.assertEqual(list(self.headers.items()), [("A", "3"), ("B", "2")])
+        self.assertIn("b", self.headers.keys())
+
+    def test_get(self) -> None:
+        """
+        Test get() with and without a default.
+        """
+        self.assertEqual(self.headers.get("a"), "3")
+        self.assertIsNone(self.headers.get("C"))
+        self.assertEqual(self.headers.get("C", "x"), "x")
+
+    def test_pop(self) -> None:
+        """
+        Test that pop() returns the last value and removes the field
+        with all its lines.
+        """
+        self.assertEqual(self.headers.pop("A"), "3")
+        self.assertEqual(self.headers.as_lines(), [("B", "2")])
+        self.assertEqual(self.headers.pop("A", "gone"), "gone")
+        with self.assertRaises(KeyError):
+            self.headers.pop("A")
+
+    def test_popitem(self) -> None:
+        """
+        Test that popitem() takes the first field.
+        """
+        self.assertEqual(self.headers.popitem(), ("A", "3"))
+        self.assertEqual(self.headers.as_lines(), [("B", "2")])
+
+    def test_setdefault(self) -> None:
+        """
+        Test that setdefault() leaves an existing field alone and adds a
+        missing one.
+        """
+        self.assertEqual(self.headers.setdefault("b", "x"), "2")
+        self.assertEqual(self.headers.setdefault("C", "x"), "x")
+        self.assertEqual(self.headers.get_all("C"), ["x"])
+
+    def test_update_with_nothing(self) -> None:
+        """
+        Test that update() without headers changes nothing.
+        """
+        self.headers.update()
+        self.headers.update(None)
+        self.assertEqual(self.headers.as_lines(), [("A", "1"), ("B", "2"), ("a", "3")])
+
+
+class HeadersEqRobustnessTestCase(unittest.TestCase):
+    """
+    tests for comparing :py:class:`action0.req.headers.Headers` with
+    mappings that cannot be headers
+    """
+
+    def test_unconvertible_mappings_are_unequal(self) -> None:
+        """
+        Test that a comparison answers instead of raising.
+        """
+        headers = Headers({"A": "1"})
+        others: list[dict[Any, Any]] = [
+            {"A": None},
+            {1: "x"},
+            {"A": b"1"},
+            {"A": "1\r\nB: 2"},
+        ]
+        for other in others:
+            with self.subTest(other=other):
+                self.assertFalse(headers == other)
+                self.assertTrue(headers != other)

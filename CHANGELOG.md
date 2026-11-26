@@ -6,9 +6,92 @@ numbers follow [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+### Added
+
+- `Request.target`: the request target to render instead of the
+  origin-form derived from the URL — `"*"` for a server-wide `OPTIONS`,
+  `"host:port"` for `CONNECT`, an absolute URL for a request to a proxy.
+  Also a constructor keyword; part of `copy()` and of equality.
+- `Request.from_str()` and `Response.from_str()`: parse the text that
+  `as_str()` renders — start line, header lines and, behind a blank
+  line, the body (as a `str`). The request URL is put together from the
+  target and the `Host` header, with the `scheme` you pass.
+- `abody_bytes()` and `abody_str()` on `Request` and `Response`, and
+  `Response.abody_file()`: the asynchronous twins of the body accessors.
+  They read a producer through `achunks()`, which makes an
+  `AsyncIterableBody` readable as a whole and as a file, and keeps a
+  file-backed body from blocking the event loop.
+- `Response.body_file()` takes `max_memory` and `dir` for the
+  `SpooledBody` a stream is read into.
+- `Request.close()` and `Request.aclose()`; a request is a sync and
+  async context manager like a response, for a body that holds a
+  resource and was never sent.
+- `IterableBody(..., threaded=True)`: `achunks()` fetches every chunk in
+  a worker thread, for an iterable that blocks while it produces one.
+  Without it the iterable runs on the event loop, as before — which is
+  now documented.
+- `Request.secret_params`: the names of the query parameters whose
+  values `repr(request)` shows as `***` (`api_key`, `token`,
+  `signature`, …), overridable like `Headers.secret_names`.
+- `BytesBody` compares by its bytes (and is hashable), so requests and
+  responses with equal `BytesBody` bodies are equal. All producers have
+  a `repr()` that says what they are without showing their data.
+- `BodyTypes`, `HeaderTypes` and `HeaderValue` are importable from the
+  package root.
+- `Header.CONNECT_UDP_BIND`, `Header.NO_VARY_SEARCH` and
+  `Header.PROXY_PUBLIC_ADDRESS`: the field names registered since the
+  last snapshot of the IANA registry (now as of 2026-11-26).
+
 ### Changed
 
-- **action0-url 0.2.0 is required** (was 0.1.0). Its changes show through
+Behaviour that code may rely on:
+
+- **A streamed body can be read once, and says so.** Reading an
+  `IterableBody` or `AsyncIterableBody` over a generator (or any other
+  iterator) a second time, or after it has been closed, raises a
+  `RuntimeError` explaining what happened. It used to return nothing,
+  which passed for an empty body — `Response.save_body()` after
+  `body_bytes()` truncated the file. A read that is between two chunks
+  when the body is closed raises as well instead of ending quietly.
+  Bodies over a list are re-readable as before; for a response,
+  `body_file()` / `abody_file()` keep a stream readable.
+- **Header names and values must not contain a CR, an LF or a NUL**:
+  `Headers` raises a `ValueError` for them, whichever way they come in.
+  `Request.as_str()` and `Response.as_str()` do the same for the method,
+  the target, the HTTP version and the reason phrase.
+- **A raw header block is split at `\r\n` and `\n` only** (it was
+  `str.splitlines()`, which also splits at `\x0b`, `\x0c`, `\x85`,
+  U+2028, … and a lone `\r`), and a line whose name contains whitespace
+  — `Name : value`, a folded line, a request line — is a `ValueError`.
+- **Bytes are not header values**: `Headers({"X": b"ab"})` raises a
+  `TypeError` (it produced the lines `X: 97` and `X: 98`), and so does a
+  string where a name/value tuple is expected (`Headers(["ab"])`).
+- **`Response.as_str()` keeps the space behind the status code** when
+  there is no phrase: `"HTTP/1.1 599 "`, as the grammar of the status
+  line requires (was `"HTTP/1.1 599"`).
+- **`Response.status` must be an int**: anything else raises a
+  `TypeError` when it is set.
+- **`FileBody.content_length()` is `None` for a path that is not a
+  regular file** (a named pipe, a device); it was the `0` of the
+  directory entry.
+- `Request.method` is uppercased whenever it is set, not only by the
+  constructor.
+- `repr(request)` shows the values of the `Request.secret_params` query
+  parameters as `***`.
+- `Headers.get_values()` no longer splits at a comma inside a quoted
+  string (`private="a, b"`).
+- `Headers.copy()` returns an instance of the same class and keeps a
+  `secret_names` set on the instance; `Request`/`Response` keep a
+  `Headers` subclass they are given, and their `copy()` returns an
+  instance of their own class.
+- A `SpooledBody` whose data cannot be moved to the temporary file is
+  closed (see Fixed).
+
+And from the dependency:
+
+- **action0-url 0.2.0 is required** (was 0.1.0), and the requirement is
+  capped below 0.3: a minor release of a 0.x package may change
+  behaviour, as this one did. Its changes show through
   wherever a request has a URL; see the
   [action0-url changelog](https://github.com/LaughInJar/action0-url/blob/main/CHANGELOG.md)
   for all of them. What you will notice in requests:
@@ -18,8 +101,8 @@ numbers follow [Semantic Versioning](https://semver.org/).
   - **The URL is kept as it is written.** Percent escapes (`%2F`, `%7E`,
     escapes that are not valid UTF-8) and the spelling of the query
     (`?flag`, `%20`) are no longer decoded and re-encoded, so
-    `request.url.as_str()` and `repr(request)` show a signed URL
-    unchanged.
+    `request.url.as_str()` shows a signed URL unchanged — and
+    `repr(request)` does too, apart from the values it redacts.
   - **Requests are equal when their URLs are equivalent:** `%7E` equals
     `~`, but `/a%2Fb` no longer equals `/a/b`.
   - **Query parameter values** have to be strings, ints, floats or bools
@@ -33,6 +116,32 @@ numbers follow [Semantic Versioning](https://semver.org/).
   action0-url 0.2.0; pass an empty mapping to remove the query.
 
 ### Fixed
+
+- `as_str(include_body=True)` raised for a body that is not text in the
+  Content-Type charset (a compressed body: `UnicodeDecodeError`) or
+  whose charset Python does not know (`LookupError`). It is a rendering
+  and shows such bytes with U+FFFD replacement characters now; the
+  accessors `body_str()` / `body_bytes()` raise as before, which is
+  documented.
+- A custom redaction was lost on the way into a request or response:
+  `Headers.copy()` and the constructors rebuilt a plain `Headers`, so a
+  subclass or an instance with more `secret_names` printed its secrets
+  in `repr()`.
+- The asynchronous file operations could be left behind by a shutdown:
+  cancelling all tasks of the loop (`asyncio.run()` on its way out, a
+  signal handler) also cancelled the task the worker thread was wrapped
+  in, and `asave_body()` closed its file while a write was still
+  running. The call is a plain future now.
+- A `SpooledBody` whose rollover to the temporary file failed midway (a
+  full disk) kept answering with a part of the data — `content_length()`
+  said one thing, `as_bytes()` returned another — and the next write
+  raised an `AttributeError`. The body is closed now and the error
+  passes through.
+- `Headers() == {"a": None}` (and other mappings that cannot be headers)
+  raised instead of being unequal.
+- Reading a named pipe or a non-seekable file object with
+  `FileBody.achunks()` on asyncio started a thread per chunk; the daemon
+  threads are reused now.
 
 Earlier releases of action0-req accept action0-url 0.2.0 as well, and
 these show up with it:

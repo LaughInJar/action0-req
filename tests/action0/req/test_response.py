@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import gzip
 import io
 import os
@@ -11,6 +12,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
+from typing import cast
 from unittest import mock
 
 from action0.req import AsyncIterableBody
@@ -24,6 +26,23 @@ from action0.req import SpooledBody
 from action0.req import Status
 from action0.req import body as body_module
 from action0.req import response as response_module
+
+
+@contextlib.contextmanager
+def _recorded_hops() -> Iterator[list[str]]:
+    """
+    Record the name of every function the response module hands to a
+    worker thread, while still running it there.
+    """
+    hops: list[str] = []
+    real = body_module._in_thread
+
+    async def dispatch(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        hops.append(getattr(function, "__name__", repr(function)))
+        return await real(function, *args, **kwargs)
+
+    with mock.patch.object(response_module, "_in_thread", dispatch):
+        yield hops
 
 
 class _Stream:
@@ -188,9 +207,17 @@ class ResponseAsStrTestCase(unittest.TestCase):
 
     def test_status_line_unknown_code(self) -> None:
         """
-        Test that an unregistered code renders without a trailing space.
+        Test that an unregistered code — no phrase — still renders the
+        space behind the status code: the status line requires it, with
+        or without a phrase (RFC 9112, section 4).
         """
-        self.assertEqual(Response(599).as_str(), "HTTP/1.1 599")
+        self.assertEqual(Response(599).as_str(), "HTTP/1.1 599 ")
+        self.assertEqual(Response(200, reason="").as_str(), "HTTP/1.1 200 ")
+        self.assertEqual(
+            Response(599, headers={"A": "1"}).as_str(separator="\n"), "HTTP/1.1 599 \nA: 1"
+        )
+        # the repr is not the wire format
+        self.assertEqual(repr(Response(599)), "Response(599)")
 
     def test_include_body(self) -> None:
         """
@@ -686,8 +713,8 @@ class ResponseBodyFileTestCase(unittest.TestCase):
         class _Recording(SpooledBody):
             """keeps track of the spools the response creates"""
 
-            def __init__(self) -> None:
-                super().__init__()
+            def __init__(self, **kwargs: Any) -> None:
+                super().__init__(**kwargs)
                 spools.append(self)
 
         stream = IterableBody(broken())
@@ -1049,3 +1076,532 @@ class ResponsePickleTestCase(unittest.TestCase):
         restored = pickle.loads(pickle.dumps(resp))
         self.assertEqual(restored, resp)
         self.assertIsNone(restored.request)
+
+
+class ResponseStatusPropertyTestCase(unittest.TestCase):
+    """
+    tests for :py:attr:`action0.req.response.Response.status` as a
+    property
+    """
+
+    def test_non_int_status_is_refused(self) -> None:
+        """
+        Test that a status that is not an int raises right away — in
+        the constructor, in an assignment and in copy() — instead of
+        failing later in a category property.
+        """
+        statuses: list[Any] = ["404", 404.0, None, b"404"]
+        for status in statuses:
+            with self.subTest(status=status):
+                with self.assertRaises(TypeError):
+                    Response(status)
+                with self.assertRaises(TypeError):
+                    Response(200).copy(status=status)
+        resp = Response(200)
+        with self.assertRaises(TypeError):
+            resp.status = cast("Any", "404")
+        self.assertEqual(resp.status, 200)
+
+    def test_assignment(self) -> None:
+        """
+        Test that the status stays a plain mutable attribute to its
+        users.
+        """
+        resp = Response(200)
+        resp.status = Status.NOT_FOUND
+        self.assertEqual((resp.status, resp.phrase), (404, "Not Found"))
+        resp.status = 599
+        self.assertTrue(resp.is_server_error)
+
+    def test_pickle_from_before_the_property(self) -> None:
+        """
+        Test that the status is kept where a plain attribute lives, so
+        a pickle written by an earlier release still loads.
+        """
+        resp = Response(404, body=b"x")
+        self.assertEqual(vars(resp)["status"], 404)
+        old = Response.__new__(Response)
+        old.__dict__.update(vars(resp))
+        self.assertEqual(old.status, 404)
+        self.assertEqual(pickle.loads(pickle.dumps(resp)), resp)
+
+
+class ResponseRenderingSafetyTestCase(unittest.TestCase):
+    """
+    tests for what :py:meth:`action0.req.response.Response.as_str`
+    refuses to render, and for what it renders whatever the body is
+    """
+
+    def test_line_breaks_in_the_status_line_are_refused(self) -> None:
+        """
+        Test that neither the reason nor the version can start a line
+        of its own.
+        """
+        for resp in (
+            Response(200, reason="OK\r\nX: 1"),
+            Response(200, reason="OK\nX: 1"),
+            Response(200, http_version="HTTP/1.1\r\nX: 1"),
+            Response(200, reason="a\x00b"),
+        ):
+            with self.subTest(reason=resp.reason):
+                with self.assertRaises(ValueError):
+                    resp.as_str()
+
+    def test_binary_body_is_rendered_with_replacements(self) -> None:
+        """
+        Test that a compressed body does not make the rendering fail.
+        """
+        resp = Response(200, body=gzip.compress(b"report"))
+        rendered = resp.as_str(include_body=True)
+        self.assertTrue(rendered.startswith("HTTP/1.1 200 OK\r\n\r\n\x1f�"))
+        with self.assertRaises(UnicodeDecodeError):
+            resp.body_str()
+
+    def test_unknown_charset_is_rendered_as_utf8(self) -> None:
+        """
+        Test that an unknown charset does not make the rendering fail.
+        """
+        resp = Response(
+            200, headers={"Content-Type": "text/plain; charset=bogus"}, body="grüße".encode()
+        )
+        self.assertTrue(resp.as_str(include_body=True).endswith("\r\n\r\ngrüße"))
+        with self.assertRaises(LookupError):
+            resp.body_str()
+
+
+class ResponseOwnershipTestCase(unittest.TestCase):
+    """
+    tests for what a response keeps of the headers and the class it is
+    given
+    """
+
+    def test_headers_subclass_is_kept(self) -> None:
+        """
+        Test that a Headers subclass — with its redaction set — survives
+        the constructor and copy().
+        """
+
+        class _Strict(Headers):
+            secret_names = Headers.secret_names | {"x-token"}
+
+        headers = _Strict({"X-Token": "s3cr3t"})
+        resp = Response(200, headers=headers)
+        self.assertIs(type(resp.headers), _Strict)
+        self.assertIsNot(resp.headers, headers)
+        self.assertEqual(repr(resp.copy().headers), "_Strict(X-Token: ***)")
+
+    def test_copy_of_a_subclass(self) -> None:
+        """
+        Test that copy() returns an instance of the response's own class.
+        """
+
+        class _Cached(Response):
+            pass
+
+        self.assertIs(type(_Cached(200).copy(status=304)), _Cached)
+
+    def test_bytes_bodies_compare_by_content(self) -> None:
+        """
+        Test that responses with equal BytesBody bodies are equal.
+        """
+        self.assertEqual(Response(200, body=BytesBody(b"x")), Response(200, body=BytesBody(b"x")))
+        self.assertNotEqual(Response(200, body=BytesBody(b"x")), Response(200, body=b"x"))
+
+
+class ResponseFromStrTestCase(unittest.TestCase):
+    """
+    tests for :py:meth:`action0.req.response.Response.from_str`
+    """
+
+    def test_parts(self) -> None:
+        """
+        Test that every part of the text ends up where it belongs.
+        """
+        resp = Response.from_str(
+            "HTTP/1.0 404 Not Here At All\r\nContent-Type: text/plain\r\nSet-Cookie: a=1\r\n\r\ngone\r\n\r\nfor good"
+        )
+        self.assertEqual(resp.status, 404)
+        self.assertEqual(resp.reason, "Not Here At All")
+        self.assertEqual(resp.http_version, "HTTP/1.0")
+        self.assertEqual(
+            resp.headers.as_lines(), [("Content-Type", "text/plain"), ("Set-Cookie", "a=1")]
+        )
+        self.assertEqual(resp.body, "gone\r\n\r\nfor good")
+
+    def test_status_line_without_phrase(self) -> None:
+        """
+        Test both spellings of a status line without a phrase: with the
+        space the grammar asks for, and without it.
+        """
+        for text in ("HTTP/1.1 599 ", "HTTP/1.1 599"):
+            with self.subTest(text=text):
+                resp = Response.from_str(text)
+                self.assertEqual(resp.status, 599)
+                self.assertIsNone(resp.reason)
+                self.assertIsNone(resp.body)
+
+    def test_round_trip(self) -> None:
+        """
+        Test that parsing what as_str() renders — and rendering it again
+        — gives the same text.
+        """
+        responses = [
+            Response(404, headers={"Content-Type": "text/plain"}, body="not here"),
+            Response(599),
+            Response(
+                200, reason="Fine By Me", headers=[("Set-Cookie", "a=1"), ("Set-Cookie", "b=2")]
+            ),
+            Response(204, http_version="HTTP/1.0"),
+            Response(200, body="a\n\nb"),
+        ]
+        for resp in responses:
+            for separator in ("\r\n", "\n"):
+                with self.subTest(resp=repr(resp), separator=separator):
+                    text = resp.as_str(include_body=True, separator=separator)
+                    parsed = Response.from_str(text)
+                    self.assertEqual(parsed.as_str(include_body=True, separator=separator), text)
+                    self.assertEqual(parsed.status, resp.status)
+                    self.assertEqual(parsed.phrase, resp.phrase)
+                    self.assertEqual(parsed.headers, resp.headers)
+                    self.assertEqual(parsed.body, resp.body)
+
+    def test_invalid_text(self) -> None:
+        """
+        Test that a status line without a numeric status code, and an
+        invalid header line, raise a ValueError.
+        """
+        for text in (
+            "",
+            "HTTP/1.1",
+            "HTTP/1.1 OK",
+            "HTTP/1.1 ²00 OK",
+            " 200 OK",
+            "HTTP/1.1 200 OK\nno colon here",
+        ):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    Response.from_str(text)
+
+    def test_subclass(self) -> None:
+        """
+        Test that the classmethod returns an instance of the class it is
+        called on.
+        """
+
+        class _Cached(Response):
+            pass
+
+        self.assertIs(type(_Cached.from_str("HTTP/1.1 200 OK")), _Cached)
+
+
+class ResponseStreamReadOnceTestCase(unittest.TestCase):
+    """
+    tests for a response whose streamed body has been read: it says so
+    instead of passing for an empty one
+    """
+
+    def test_second_read_raises(self) -> None:
+        """
+        Test every synchronous way of reading the body a second time.
+        """
+        resp = Response(200, body=IterableBody(chunk for chunk in [b"a", b"b"]))
+        self.assertEqual(resp.body_bytes(), b"ab")
+        for read in (resp.body_bytes, resp.body_str, resp.body_file):
+            with self.subTest(read=read.__name__):
+                with self.assertRaisesRegex(RuntimeError, "has been read already"):
+                    read()
+
+    def test_save_body_after_a_read_leaves_the_file_alone(self) -> None:
+        """
+        Test the case that used to lose data: saving a body that has
+        been read does not truncate the file.
+        """
+        resp = Response(200, body=IterableBody(chunk for chunk in [b"new"]))
+        resp.body_bytes()
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "download.bin"
+            path.write_bytes(b"precious")
+            with self.assertRaises(RuntimeError):
+                resp.save_body(path)
+            self.assertEqual(path.read_bytes(), b"precious")
+
+    def test_body_file_first_keeps_the_body_readable(self) -> None:
+        """
+        Test the way out the error points to: after body_file() the
+        body can be read any number of times.
+        """
+        with Response(200, body=IterableBody(chunk for chunk in [b"a", b"b"])) as resp:
+            file = resp.body_file()
+            assert file is not None
+            self.assertEqual(file.read(), b"ab")
+            self.assertEqual(resp.body_bytes(), b"ab")
+            self.assertEqual(resp.body_bytes(), b"ab")
+
+
+class ResponseBodyFileOptionsTestCase(unittest.TestCase):
+    """
+    tests for the spool options of
+    :py:meth:`action0.req.response.Response.body_file`
+    """
+
+    def test_max_memory(self) -> None:
+        """
+        Test that the threshold of the spool can be chosen, and that
+        the default keeps a small body in memory.
+        """
+        with Response(200, body=IterableBody([b"abc", b"def"])) as resp:
+            resp.body_file()
+            assert isinstance(resp.body, SpooledBody)
+            self.assertFalse(resp.body.rolled)
+        with Response(200, body=IterableBody([b"abc", b"def"])) as resp:
+            resp.body_file(max_memory=4)
+            assert isinstance(resp.body, SpooledBody)
+            self.assertTrue(resp.body.rolled)
+
+    def test_dir(self) -> None:
+        """
+        Test that the temporary file goes where it is told to: a
+        directory that does not exist makes the rollover fail.
+        """
+        resp = Response(200, body=IterableBody([b"abc", b"def"]))
+        with self.assertRaises(OSError):
+            resp.body_file(max_memory=0, dir="/nonexistent/directory")
+        with TemporaryDirectory() as tmp:
+            with Response(200, body=IterableBody([b"abc", b"def"])) as resp:
+                file = resp.body_file(max_memory=0, dir=tmp)
+                assert file is not None
+                self.assertEqual(file.read(), b"abcdef")
+
+    def test_options_reach_the_spool_of_an_async_only_stream(self) -> None:
+        """
+        Test that the spool replacing a stream only aclose() can release
+        gets the options too.
+        """
+
+        class _AsyncConnection(_Stream):
+            async def aclose(self) -> None:
+                pass
+
+        resp = Response(200, body=_AsyncConnection())
+        resp.body_file(max_memory=4)
+        assert isinstance(resp.body, SpooledBody)
+        self.assertTrue(resp.body.rolled)
+        asyncio.run(resp.aclose())
+
+    def test_producer_without_any_close(self) -> None:
+        """
+        Test that a producer with neither close() nor aclose() is
+        spooled and simply let go.
+        """
+        with Response(200, body=_Stream()) as resp:
+            file = resp.body_file()
+            assert file is not None
+            self.assertEqual(file.read(), b"chunk1chunk2")
+            self.assertIs(type(resp.body), SpooledBody)
+
+
+class ResponseAsyncBodyTestCase(unittest.IsolatedAsyncioTestCase):
+    """
+    tests for the asynchronous body accessors of
+    :py:class:`action0.req.response.Response`: abody_bytes(),
+    abody_str() and abody_file()
+    """
+
+    def setUp(self) -> None:
+        self.released: list[str] = []
+
+    async def _release(self) -> None:
+        self.released.append("released")
+
+    @staticmethod
+    async def _source() -> AsyncIterator[bytes]:
+        yield b"chunk1"
+        yield b"chunk2"
+
+    async def test_abody_bytes_and_str(self) -> None:
+        """
+        Test that an async-only body is read, and plain bodies come out
+        as with the synchronous accessors.
+        """
+        resp = Response(200, body=AsyncIterableBody(self._source(), aclose=self._release))
+        self.assertEqual(await resp.abody_bytes(), b"chunk1chunk2")
+        self.assertEqual(self.released, ["released"])
+        resp = Response(200, body=AsyncIterableBody(self._source()))
+        self.assertEqual(await resp.abody_str(), "chunk1chunk2")
+        with self.assertRaisesRegex(RuntimeError, "has been read already"):
+            await resp.abody_str()
+
+        latin = {"Content-Type": "text/plain; charset=latin-1"}
+        self.assertIsNone(await Response(204).abody_bytes())
+        self.assertIsNone(await Response(204).abody_str())
+        self.assertEqual(await Response(200, body="ä", headers=latin).abody_bytes(), b"\xe4")
+        self.assertEqual(await Response(200, body=b"\xe4", headers=latin).abody_str(), "ä")
+
+    async def test_abody_file_spools_an_async_stream(self) -> None:
+        """
+        Test that an async-only stream becomes a file: it is spooled,
+        the spool replaces the body, the stream is closed — and the
+        response is readable again and again afterwards.
+        """
+        stream = AsyncIterableBody(self._source(), aclose=self._release)
+        async with Response(200, body=stream) as resp:
+            file = await resp.abody_file()
+            assert file is not None
+            self.assertEqual(file.read(), b"chunk1chunk2")
+            self.assertIs(type(resp.body), SpooledBody)
+            self.assertEqual(self.released, ["released"])
+            self.assertEqual(await resp.abody_bytes(), b"chunk1chunk2")
+            self.assertEqual(resp.body_bytes(), b"chunk1chunk2")
+            spool = resp.body
+        assert isinstance(spool, SpooledBody)
+        self.assertTrue(spool.closed)
+        self.assertEqual(self.released, ["released"])
+
+    async def test_abody_file_options(self) -> None:
+        """
+        Test that the spool options are passed on.
+        """
+        async with Response(200, body=AsyncIterableBody(self._source())) as resp:
+            await resp.abody_file(max_memory=4)
+            assert isinstance(resp.body, SpooledBody)
+            self.assertTrue(resp.body.rolled)
+
+    async def test_abody_file_of_plain_bodies(self) -> None:
+        """
+        Test the bodies that need no spooling: none, in-memory ones and
+        a spooled one.
+        """
+        self.assertIsNone(await Response(204).abody_file())
+        for body in (b"data", "data", BytesBody(b"data")):
+            with self.subTest(body=type(body).__name__):
+                resp = Response(200, body=body)
+                file = await resp.abody_file()
+                assert file is not None
+                self.assertEqual(file.read(), b"data")
+                self.assertIs(resp.body, body)
+        with SpooledBody() as spooled:
+            spooled.write(b"data")
+            resp = Response(200, body=spooled)
+            file = await resp.abody_file()
+            assert file is not None
+            self.assertEqual(file.read(), b"data")
+            self.assertIs(resp.body, spooled)
+
+    async def test_abody_file_of_a_file_body(self) -> None:
+        """
+        Test that a FileBody hands out its file without a copy — looked
+        up in a worker thread — and that a non-seekable one is spooled.
+        """
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "data.bin"
+            path.write_bytes(b"data")
+            body = FileBody(path)
+            resp = Response(200, body=body)
+            with _recorded_hops() as hops:
+                file = await resp.abody_file()
+            assert file is not None
+            self.assertEqual(file.read(), b"data")
+            self.assertIs(resp.body, body)
+            self.assertEqual(hops, ["_file_view"])
+            resp.close()
+            self.assertTrue(file.closed)
+
+        class _Pipe:
+            def __init__(self) -> None:
+                self._buffer = io.BytesIO(b"data")
+
+            def seekable(self) -> bool:
+                return False
+
+            def read(self, size: int = -1) -> bytes:
+                return self._buffer.read(size)
+
+        async with Response(200, body=FileBody(cast("Any", _Pipe()))) as resp:
+            file = await resp.abody_file()
+            assert file is not None
+            self.assertEqual(file.read(), b"data")
+            self.assertIs(type(resp.body), SpooledBody)
+
+    async def test_abody_file_closes_a_sync_producer(self) -> None:
+        """
+        Test that a producer without aclose() is released through its
+        close().
+        """
+
+        class _Connection(_Stream):
+            closed = 0
+
+            def close(self) -> None:
+                self.closed += 1
+
+        connection = _Connection()
+        async with Response(200, body=connection) as resp:
+            file = await resp.abody_file()
+            assert file is not None
+            self.assertEqual(file.read(), b"chunk1chunk2")
+            self.assertEqual(connection.closed, 1)
+
+    async def test_abody_file_of_a_broken_stream(self) -> None:
+        """
+        Test that a stream breaking off raises, keeps the body as it
+        was and leaves no spool behind.
+        """
+
+        async def broken() -> AsyncIterator[bytes]:
+            yield b"chunk1"
+            raise ConnectionResetError("gone")
+
+        spools: list[SpooledBody] = []
+
+        class _Recording(SpooledBody):
+            def __init__(self, **kwargs: Any) -> None:
+                super().__init__(**kwargs)
+                spools.append(self)
+
+        stream = AsyncIterableBody(broken(), aclose=self._release)
+        resp = Response(200, body=stream)
+        with mock.patch.object(response_module, "SpooledBody", _Recording):
+            with self.assertRaises(ConnectionResetError):
+                await resp.abody_file()
+        self.assertIs(resp.body, stream)
+        self.assertEqual(len(spools), 1)
+        self.assertTrue(spools[0].closed)
+        self.assertEqual(self.released, ["released"])
+
+    async def test_abody_file_of_a_stream_read_before(self) -> None:
+        """
+        Test that a stream that has been read is refused, not spooled
+        as an empty body.
+        """
+        resp = Response(200, body=AsyncIterableBody(self._source()))
+        await resp.abody_bytes()
+        with self.assertRaisesRegex(RuntimeError, "has been read already"):
+            await resp.abody_file()
+        self.assertIsInstance(resp.body, AsyncIterableBody)
+
+    async def test_abody_file_with_a_plain_async_iterator(self) -> None:
+        """
+        Test a third-party producer whose achunks() is not an async
+        generator: there is nothing to close after the read.
+        """
+
+        class _Chunks:
+            def __init__(self) -> None:
+                self._left = [b"chunk1", b"chunk2"]
+
+            def __aiter__(self) -> "_Chunks":
+                return self
+
+            async def __anext__(self) -> bytes:
+                if not self._left:
+                    raise StopAsyncIteration
+                return self._left.pop(0)
+
+        class _Plain(_Stream):
+            def achunks(self) -> AsyncIterator[bytes]:
+                return _Chunks()
+
+        async with Response(200, body=_Plain()) as resp:
+            file = await resp.abody_file()
+            assert file is not None
+            self.assertEqual(file.read(), b"chunk1chunk2")

@@ -10,6 +10,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # the whole history: the tag is checked against main below
+          fetch-depth: 0
+
+      - name: Check that the tag is on main
+        run: |
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "tag $GITHUB_REF_NAME points at $GITHUB_SHA, which is not on main" >&2
+            exit 1
+          fi
 
       - name: Install uv
         uses: astral-sh/setup-uv@v10.0.1
@@ -31,6 +42,14 @@ jobs:
           version=$(uv run python -c "from action0.req import __version__; print(__version__)")
           if [ "v$version" != "$GITHUB_REF_NAME" ]; then
             echo "tag $GITHUB_REF_NAME does not match __version__ $version" >&2
+            exit 1
+          fi
+
+      - name: Check that the changelog has a section for the version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if ! grep -qE "^## ${version//./\\.} — [0-9]{4}-[0-9]{2}-[0-9]{2}$" CHANGELOG.md; then
+            echo "CHANGELOG.md has no \"## $version — YYYY-MM-DD\" section" >&2
             exit 1
           fi
 

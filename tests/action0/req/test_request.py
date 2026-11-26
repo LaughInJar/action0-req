@@ -1,8 +1,13 @@
+import asyncio
+import pickle
 import unittest
+from collections.abc import AsyncIterator
 from typing import Any
 
+from action0.req import AsyncIterableBody
 from action0.req import BytesBody
 from action0.req import Headers
+from action0.req import IterableBody
 from action0.req import Method
 from action0.req import Request
 from action0.url import Url
@@ -552,3 +557,556 @@ class MetaTestCase(unittest.TestCase):
         plain = Request("https://example.com/")
         tagged = Request("https://example.com/", meta={"my-lib.key": "value"})
         self.assertEqual(plain, tagged)
+
+
+class RequestMethodPropertyTestCase(unittest.TestCase):
+    """
+    tests for :py:attr:`action0.req.request.Request.method` as a property
+    """
+
+    def test_assignment_uppercases(self) -> None:
+        """
+        Test that the method is uppercased by an assignment like by the
+        constructor, so the rendering and the comparison agree.
+        """
+        req = Request("https://a/")
+        req.method = "post"
+        self.assertEqual(req.method, "POST")
+        self.assertEqual(req.as_str(), "POST / HTTP/1.1\r\nHost: a")
+        self.assertEqual(req, Request("https://a/", "POST"))
+
+    def test_method_member_is_stored_as_a_plain_string(self) -> None:
+        """
+        Test that a Method member comes out as the plain string.
+        """
+        req = Request("https://a/", Method.PATCH)
+        self.assertIs(type(req.method), str)
+        self.assertEqual(req.method, "PATCH")
+
+    def test_pickle_round_trip(self) -> None:
+        """
+        Test that a request survives pickling — and that the method is
+        kept where a plain attribute lives, so a pickle from before it
+        was a property still loads.
+        """
+        req = Request(
+            "https://api.example.com/a%2Fb?x=1",
+            "POST",
+            headers={"Accept": "*/*"},
+            body=b"data",
+            target="*",
+            meta={"k": "v"},
+        )
+        restored = pickle.loads(pickle.dumps(req))
+        self.assertEqual(restored, req)
+        self.assertEqual(restored.meta, {"k": "v"})
+        self.assertEqual(restored.as_str(), req.as_str())
+        self.assertEqual(vars(req)["method"], "POST")
+
+        old = Request.__new__(Request)
+        old.__dict__.update(vars(Request("https://a/", "PUT")))
+        self.assertEqual(old.method, "PUT")
+
+
+class RequestTargetTestCase(unittest.TestCase):
+    """
+    tests for the explicit request target of
+    :py:class:`action0.req.request.Request`
+    """
+
+    def test_default_is_the_origin_form(self) -> None:
+        """
+        Test that without a target the origin-form is derived as before.
+        """
+        req = Request("https://e.com/a?b=1")
+        self.assertIsNone(req.target)
+        self.assertEqual(req.as_str(), "GET /a?b=1 HTTP/1.1\r\nHost: e.com")
+
+    def test_asterisk_form(self) -> None:
+        """
+        Test the server-wide OPTIONS: the target is "*", the Host still
+        comes from the URL.
+        """
+        req = Request("https://e.com", "OPTIONS", target="*")
+        self.assertEqual(req.as_str(), "OPTIONS * HTTP/1.1\r\nHost: e.com")
+
+    def test_authority_form(self) -> None:
+        """
+        Test the target of a CONNECT request.
+        """
+        req = Request("//e.com:443", "CONNECT", target="e.com:443")
+        self.assertEqual(req.as_str(), "CONNECT e.com:443 HTTP/1.1\r\nHost: e.com:443")
+
+    def test_absolute_form(self) -> None:
+        """
+        Test the target of a request to a proxy.
+        """
+        url = "http://e.com/a?b=1"
+        self.assertEqual(Request(url, target=url).as_str(), f"GET {url} HTTP/1.1\r\nHost: e.com")
+
+    def test_target_is_a_plain_attribute(self) -> None:
+        """
+        Test that the target can be set and removed later.
+        """
+        req = Request("https://e.com/a")
+        req.target = "*"
+        self.assertEqual(req.as_str(), "GET * HTTP/1.1\r\nHost: e.com")
+        req.target = None
+        self.assertEqual(req.as_str(), "GET /a HTTP/1.1\r\nHost: e.com")
+
+    def test_target_is_part_of_copy_and_equality(self) -> None:
+        """
+        Test that a copy keeps the target, that it can be overridden,
+        and that requests differing in it are not equal.
+        """
+        req = Request("https://e.com", "OPTIONS", target="*")
+        self.assertEqual(req.copy().target, "*")
+        self.assertEqual(req.copy(), req)
+        self.assertIsNone(req.copy(target=None).target)
+        self.assertNotEqual(req.copy(target=None), req)
+
+
+class RequestRenderingSafetyTestCase(unittest.TestCase):
+    """
+    tests for what :py:meth:`action0.req.request.Request.as_str` refuses
+    to render, and for what it renders whatever the body is
+    """
+
+    def test_line_breaks_in_the_request_line_are_refused(self) -> None:
+        """
+        Test that no part of the request line can start a line of its
+        own.
+        """
+        requests = [
+            Request("https://a/", "GET / HTTP/1.1\r\nX: y"),
+            Request("https://a/", target="/\r\nX: y"),
+            Request("https://a/", http_version="HTTP/1.1\nX: y"),
+            Request("https://a/", target="/\x00"),
+        ]
+        for req in requests:
+            with self.subTest(req=req.method):
+                with self.assertRaises(ValueError):
+                    req.as_str()
+
+    def test_binary_body_is_rendered_with_replacements(self) -> None:
+        """
+        Test that a body that is not text does not make the rendering
+        fail: what cannot be decoded shows as U+FFFD.
+        """
+        req = Request("https://a/", "POST", body=b"\x1f\x8b\x08ok")
+        rendered = req.as_str(include_body=True)
+        self.assertTrue(rendered.endswith("\r\n\r\n\x1f�\x08ok"))
+
+    def test_unknown_charset_is_rendered_as_utf8(self) -> None:
+        """
+        Test that a charset Python does not know does not make the
+        rendering fail either, while the accessor still says so.
+        """
+        req = Request(
+            "https://a/",
+            "POST",
+            headers={"Content-Type": "text/plain; charset=bogus"},
+            body="grüße".encode(),
+        )
+        self.assertTrue(req.as_str(include_body=True).endswith("\r\n\r\ngrüße"))
+        with self.assertRaises(LookupError):
+            req.body_str()
+
+    def test_charset_behind_another_parameter(self) -> None:
+        """
+        Test that the charset is found among several Content-Type
+        parameters, whatever its position and quoting.
+        """
+        for content_type in (
+            'text/plain; format=flowed; charset="latin-1"',
+            "text/plain; charset=latin-1; format=flowed",
+            "text/plain;format=flowed;CHARSET=latin-1",
+        ):
+            with self.subTest(content_type=content_type):
+                req = Request("https://a/", headers={"Content-Type": content_type}, body="ä")
+                self.assertEqual(req.body_bytes(), b"\xe4")
+        # a parameter without a value, and no charset at all
+        req = Request("https://a/", headers={"Content-Type": "text/plain; flag"}, body="ä")
+        self.assertEqual(req.body_bytes(), "ä".encode())
+
+
+class RequestHeadersOwnershipTestCase(unittest.TestCase):
+    """
+    tests for what a request keeps of the headers and the class it is
+    given
+    """
+
+    def test_headers_subclass_is_kept(self) -> None:
+        """
+        Test that a Headers subclass — with its redaction set — survives
+        the constructor and copy(), as a copy of its own.
+        """
+
+        class _Strict(Headers):
+            secret_names = Headers.secret_names | {"x-token"}
+
+        headers = _Strict({"X-Token": "s3cr3t"})
+        req = Request("https://a/", headers=headers)
+        self.assertIs(type(req.headers), _Strict)
+        self.assertIsNot(req.headers, headers)
+        self.assertEqual(repr(req.headers), "_Strict(X-Token: ***)")
+        self.assertEqual(repr(req.copy().headers), "_Strict(X-Token: ***)")
+        req.headers["A"] = "1"
+        self.assertNotIn("A", headers)
+
+    def test_instance_secret_names_are_kept(self) -> None:
+        """
+        Test that a redaction set assigned to the headers instance
+        travels into the request and its copies.
+        """
+        headers = Headers({"X-Token": "s3cr3t"})
+        headers.secret_names = headers.secret_names | {"x-token"}
+        req = Request("https://a/", headers=headers)
+        self.assertEqual(repr(req.headers), "Headers(X-Token: ***)")
+        self.assertEqual(repr(req.copy().headers), "Headers(X-Token: ***)")
+
+    def test_copy_of_a_subclass(self) -> None:
+        """
+        Test that copy() returns an instance of the request's own class.
+        """
+
+        class _Traced(Request):
+            pass
+
+        self.assertIs(type(_Traced("https://a/").copy(method="POST")), _Traced)
+
+    def test_bytes_bodies_compare_by_content(self) -> None:
+        """
+        Test that requests with equal BytesBody bodies are equal.
+        """
+        self.assertEqual(
+            Request("https://a/", body=BytesBody(b"x")),
+            Request("https://a/", body=BytesBody(b"x")),
+        )
+        self.assertNotEqual(
+            Request("https://a/", body=BytesBody(b"x")),
+            Request("https://a/", body=BytesBody(b"y")),
+        )
+
+
+class RequestReprSecretsTestCase(unittest.TestCase):
+    """
+    tests for the redaction of secret query parameters in the repr of
+    :py:class:`action0.req.request.Request`
+    """
+
+    def test_secret_params_are_redacted(self) -> None:
+        """
+        Test that the values of the known secret parameters show as
+        "***" — matched case-insensitively and with the name decoded —
+        while everything else stays as it is written.
+        """
+        req = Request("https://a/p?x=1&api_key=SECRET&flag&API_KEY=two&sig=x%2By&to%6Ben=t#f?g")
+        self.assertEqual(
+            repr(req),
+            "Request(GET https://a/p?x=1&api_key=***&flag&API_KEY=***&sig=***&to%6Ben=***#f?g)",
+        )
+        for secret in ("SECRET", "two", "x%2By"):
+            self.assertNotIn(secret, repr(req))
+
+    def test_only_the_repr_redacts(self) -> None:
+        """
+        Test that the URL and the wire rendering keep the values.
+        """
+        req = Request("https://a/p?token=abc")
+        self.assertEqual(req.url.as_str(), "https://a/p?token=abc")
+        self.assertEqual(req.as_str(), "GET /p?token=abc HTTP/1.1\r\nHost: a")
+
+    def test_urls_without_secrets_are_untouched(self) -> None:
+        """
+        Test URLs without a query, with a "?" in the fragment only, and
+        with a secret name that has no value.
+        """
+        self.assertEqual(repr(Request("https://a/p")), "Request(GET https://a/p)")
+        self.assertEqual(
+            repr(Request("https://a/p#token=1?x")), "Request(GET https://a/p#token=1?x)"
+        )
+        self.assertEqual(repr(Request("https://a/p?token")), "Request(GET https://a/p?token)")
+
+    def test_secret_params_are_overridable(self) -> None:
+        """
+        Test that the set can be extended on an instance or a subclass.
+        """
+        req = Request("https://a/p?session=abc&token=t")
+        req.secret_params = frozenset({"session"})
+        self.assertEqual(repr(req), "Request(GET https://a/p?session=***&token=t)")
+
+        class _Strict(Request):
+            secret_params = Request.secret_params | {"session"}
+
+        self.assertEqual(
+            repr(_Strict("https://a/p?session=abc&token=t")),
+            "_Strict(GET https://a/p?session=***&token=***)",
+        )
+
+
+class RequestFromStrTestCase(unittest.TestCase):
+    """
+    tests for :py:meth:`action0.req.request.Request.from_str`
+    """
+
+    def test_parts(self) -> None:
+        """
+        Test that every part of the text ends up where it belongs.
+        """
+        req = Request.from_str(
+            "POST /items?page=2 HTTP/1.0\r\nHost: api.example.com\r\nAccept: */*\r\n\r\nline1\r\n\r\nline2"
+        )
+        self.assertEqual(req.method, "POST")
+        self.assertEqual(req.http_version, "HTTP/1.0")
+        self.assertEqual(req.url.as_str(), "//api.example.com/items?page=2")
+        self.assertEqual(req.headers.as_lines(), [("Host", "api.example.com"), ("Accept", "*/*")])
+        self.assertEqual(req.body, "line1\r\n\r\nline2")
+        self.assertIsNone(req.target)
+
+    def test_scheme(self) -> None:
+        """
+        Test that the scheme is applied where the text has none.
+        """
+        req = Request.from_str("GET /a HTTP/1.1\nHost: e.com", scheme="https")
+        self.assertEqual(req.url.as_str(), "https://e.com/a")
+        self.assertEqual(req, Request("https://e.com/a", headers={"Host": "e.com"}))
+
+    def test_no_body(self) -> None:
+        """
+        Test that a text without a blank line, or with nothing behind
+        it, has no body.
+        """
+        self.assertIsNone(Request.from_str("GET / HTTP/1.1\r\nHost: a").body)
+        self.assertIsNone(Request.from_str("GET / HTTP/1.1\r\nHost: a\r\n\r\n").body)
+        self.assertIsNone(Request.from_str("GET / HTTP/1.1").body)
+
+    def test_round_trip(self) -> None:
+        """
+        Test that parsing what as_str() renders — and rendering it again
+        — gives the same text, for every target form and separator.
+        """
+        requests = [
+            Request("https://api.example.com/items?page=2", headers={"Accept": "*/*"}),
+            Request("https://bücher.example/a%2Fb?sig=x%2By&flag", "POST", body="payload"),
+            Request("https://[::1]:8080/x", body="a\n\nb"),
+            Request("/just/a/path?q"),
+            Request("https://e.com//double"),
+            Request("https://e.com", "OPTIONS", target="*"),
+            Request("//e.com:443", "CONNECT", target="e.com:443"),
+            Request("http://e.com/a?b", target="http://e.com/a?b"),
+            Request(http_version="HTTP/1.0"),
+        ]
+        for req in requests:
+            for separator in ("\r\n", "\n"):
+                with self.subTest(req=repr(req), separator=separator):
+                    text = req.as_str(include_body=True, separator=separator)
+                    parsed = Request.from_str(text)
+                    self.assertEqual(parsed.as_str(include_body=True, separator=separator), text)
+                    self.assertEqual(parsed.method, req.method)
+                    self.assertEqual(parsed.body, req.body)
+
+    def test_path_starting_with_two_slashes_without_host(self) -> None:
+        """
+        Test that a path with an empty first segment is not taken for a
+        host when there is no Host header.
+        """
+        req = Request.from_str("GET //a/b HTTP/1.1")
+        self.assertFalse(req.url.hostname)
+        self.assertEqual(req.url.path, "//a/b")
+        self.assertEqual(req.as_str(), "GET //a/b HTTP/1.1")
+
+    def test_other_target_forms_build_a_url(self) -> None:
+        """
+        Test that the URL is filled in as far as the text allows for the
+        targets that are kept explicitly.
+        """
+        req = Request.from_str("OPTIONS * HTTP/1.1\nHost: e.com")
+        self.assertEqual((req.target, req.url.as_str()), ("*", "//e.com"))
+        req = Request.from_str("OPTIONS * HTTP/1.1")
+        self.assertEqual((req.target, req.url.as_str()), ("*", ""))
+        req = Request.from_str("CONNECT e.com:443 HTTP/1.1", scheme="https")
+        self.assertEqual((req.target, req.url.hostname, req.url.port), ("e.com:443", "e.com", 443))
+        req = Request.from_str("GET http://e.com/a?b HTTP/1.1\nHost: proxy", scheme="https")
+        self.assertEqual((req.target, req.url.as_str()), ("http://e.com/a?b", "http://e.com/a?b"))
+
+    def test_target_the_url_would_respell_is_kept(self) -> None:
+        """
+        Test that a target the Url does not render the way it is written
+        is kept explicitly: the request line comes out as it came in.
+        """
+        text = "GET /a%zzb HTTP/1.1\r\nHost: e.com"
+        req = Request.from_str(text)
+        self.assertEqual(req.target, "/a%zzb")
+        self.assertEqual(req.as_str(), text)
+
+    def test_leading_empty_lines_are_skipped(self) -> None:
+        """
+        Test that empty lines ahead of the request line are ignored.
+        """
+        self.assertEqual(Request.from_str("\r\n\r\nGET / HTTP/1.1\r\nHost: a").method, "GET")
+
+    def test_invalid_text(self) -> None:
+        """
+        Test that a request line with too few or too many parts, and an
+        invalid header line, raise a ValueError.
+        """
+        for text in (
+            "",
+            "GET /",
+            "GET  / HTTP/1.1",
+            "GET / HTTP/1.1 extra",
+            "GET / HTTP/1.1\nno colon here",
+            "GET / HTTP/1.1\nName : value",
+        ):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    Request.from_str(text)
+
+    def test_subclass(self) -> None:
+        """
+        Test that the classmethod returns an instance of the class it is
+        called on.
+        """
+
+        class _Traced(Request):
+            pass
+
+        self.assertIs(type(_Traced.from_str("GET / HTTP/1.1")), _Traced)
+
+
+class RequestCloseTestCase(unittest.TestCase):
+    """
+    tests for close(), aclose() and the context managers of
+    :py:class:`action0.req.request.Request`
+    """
+
+    def test_close_is_a_noop_for_plain_bodies(self) -> None:
+        """
+        Test that requests whose body holds nothing can be closed any
+        number of times.
+        """
+        for body in (None, b"bytes", "text", BytesBody(b"x")):
+            with self.subTest(body=type(body).__name__):
+                req = Request("https://a/", body=body)
+                req.close()
+                req.close()
+                asyncio.run(req.aclose())
+
+    def test_close_releases_a_streamed_body(self) -> None:
+        """
+        Test that close() runs the callback of a body that was never
+        sent, and that the with block does the same.
+        """
+        released: list[bool] = []
+        req = Request(
+            "https://a/",
+            "PUT",
+            body=IterableBody(iter([b"x"]), close=lambda: released.append(True)),
+        )
+        req.close()
+        req.close()
+        self.assertEqual(released, [True])
+
+        body = IterableBody(iter([b"x"]), close=lambda: released.append(True))
+        with Request("https://a/", "PUT", body=body) as entered:
+            self.assertIsInstance(entered, Request)
+        self.assertEqual(released, [True, True])
+
+    def test_close_refuses_an_async_only_body(self) -> None:
+        """
+        Test that close() does not silently skip a body only aclose()
+        can release, and that aclose() and ``async with`` release it.
+        """
+        released: list[bool] = []
+
+        async def source() -> AsyncIterator[bytes]:
+            yield b"x"  # pragma: no cover
+
+        async def release() -> None:
+            released.append(True)
+
+        async def main() -> None:
+            req = Request("https://a/", "PUT", body=AsyncIterableBody(source(), aclose=release))
+            with self.assertRaises(RuntimeError):
+                req.close()
+            self.assertEqual(released, [])
+            await req.aclose()
+            self.assertEqual(released, [True])
+
+            body = AsyncIterableBody(source(), aclose=release)
+            async with Request("https://a/", "PUT", body=body) as entered:
+                self.assertIsInstance(entered, Request)
+            self.assertEqual(released, [True, True])
+
+        asyncio.run(main())
+
+    def test_context_manager_does_not_replace_the_error(self) -> None:
+        """
+        Test that a failure to close is attached as a note to the
+        exception the block was left by — sync and async.
+        """
+
+        def failing() -> None:
+            raise OSError("cannot close")
+
+        with self.assertRaises(KeyError) as raised:
+            with Request("https://a/", body=IterableBody([b"x"], close=failing)):
+                raise KeyError("boom")
+        self.assertIn("closing the request failed as well", raised.exception.__notes__[0])
+
+        async def main() -> None:
+            async with Request("https://a/", body=IterableBody([b"x"], close=failing)):
+                raise KeyError("boom")
+
+        with self.assertRaises(KeyError) as raised:
+            asyncio.run(main())
+        self.assertIn("closing the request failed as well", raised.exception.__notes__[0])
+
+        # without an exception in flight the failure is the error
+        with self.assertRaises(OSError):
+            with Request("https://a/", body=IterableBody([b"x"], close=failing)):
+                pass
+
+
+class RequestAsyncBodyTestCase(unittest.IsolatedAsyncioTestCase):
+    """
+    tests for the asynchronous body accessors of
+    :py:class:`action0.req.request.Request`
+    """
+
+    @staticmethod
+    async def _source() -> AsyncIterator[bytes]:
+        yield "grü".encode("latin-1")
+        yield "ße".encode("latin-1")
+
+    async def test_plain_bodies(self) -> None:
+        """
+        Test that bytes, str and no body come out as with the
+        synchronous accessors.
+        """
+        latin = {"Content-Type": "text/plain; charset=latin-1"}
+        self.assertIsNone(await Request().abody_bytes())
+        self.assertIsNone(await Request().abody_str())
+        self.assertEqual(await Request(body="ä", headers=latin).abody_bytes(), b"\xe4")
+        self.assertEqual(await Request(body=b"\xe4", headers=latin).abody_str(), "ä")
+
+    async def test_async_stream(self) -> None:
+        """
+        Test that a body which can only be read asynchronously is read,
+        and decoded with the Content-Type charset.
+        """
+        latin = {"Content-Type": "text/plain; charset=latin-1"}
+        req = Request(body=AsyncIterableBody(self._source()), headers=latin)
+        self.assertEqual(await req.abody_bytes(), "grüße".encode("latin-1"))
+        req = Request(body=AsyncIterableBody(self._source()), headers=latin)
+        self.assertEqual(await req.abody_str(), "grüße")
+        with self.assertRaisesRegex(RuntimeError, "has been read already"):
+            await req.abody_bytes()
+
+    async def test_sync_producers(self) -> None:
+        """
+        Test that the producers readable both ways work as well.
+        """
+        self.assertEqual(await Request(body=BytesBody(b"abc")).abody_bytes(), b"abc")
+        self.assertEqual(await Request(body=IterableBody([b"a", b"b"])).abody_str(), "ab")
